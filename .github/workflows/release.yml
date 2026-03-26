@@ -1,0 +1,51 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Update TOC metadata from tag
+        env:
+          CF_PROJECT_ID: ${{ vars.CF_PROJECT_ID }}
+        run: |
+          python - <<'PY2'
+          from pathlib import Path
+          import os
+
+          toc = Path("EchoesOfAzeroth.toc")
+          lines = toc.read_text().splitlines()
+          tag = os.environ["GITHUB_REF"].removeprefix("refs/tags/v")
+          project_id = os.environ.get("CF_PROJECT_ID", "").strip()
+
+          updated = []
+          for line in lines:
+              if line.startswith("## Version:"):
+                  updated.append(f"## Version: {tag}")
+                  if project_id:
+                      updated.append(f"## X-Curse-Project-ID: {project_id}")
+                  continue
+              if line.startswith("## X-Curse-Project-ID:"):
+                  continue
+              updated.append(line)
+
+          toc.write_text("\n".join(updated) + "\n")
+          PY2
+
+      - uses: BigWigsMods/packager@v2
+        with:
+          args: -g retail
+        env:
+          CF_API_KEY: ${{ secrets.CF_API_KEY }}
+          GITHUB_OAUTH: ${{ secrets.GITHUB_TOKEN }}

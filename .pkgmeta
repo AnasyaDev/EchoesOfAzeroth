@@ -1,0 +1,9 @@
+package-as: EchoesOfAzeroth
+enable-nolib-creation: no
+
+ignore:
+  - docs
+  - README.md
+  - .github
+  - .cursor
+  - .gitignore
