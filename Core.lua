@@ -26,6 +26,8 @@ local optionsInitialized = false
 local api = _G.EchoesOfAzeroth or {}
 
 _G.EchoesOfAzeroth = api
+ns.PluginDsl = ns.PluginDsl or api.PluginDsl
+api.PluginDsl = ns.PluginDsl
 
 local function DeepCopy(value)
     if type(value) ~= "table" then
@@ -44,6 +46,51 @@ local function BuildTrackNames(tracks)
         names[id] = name
     end
     return names
+end
+
+local function Warn(message)
+    if _G.DEFAULT_CHAT_FRAME and _G.DEFAULT_CHAT_FRAME.AddMessage then
+        _G.DEFAULT_CHAT_FRAME:AddMessage(PREFIX .. message)
+        return
+    end
+    print(PREFIX .. message)
+end
+
+local function BuildDerivedSubzoneKeys(subzoneNames)
+    local subzoneKeys = {}
+    for key, localizedText in pairs(subzoneNames or {}) do
+        if localizedText ~= nil then
+            subzoneKeys[localizedText] = key
+        end
+    end
+    return subzoneKeys
+end
+
+local function BuildSortedPackOrder(packs, qualifyFn)
+    local keys = {}
+    for key in pairs(packs or {}) do
+        keys[#keys + 1] = key
+    end
+    table.sort(keys, function(a, b)
+        local packA = packs and packs[a] or nil
+        local packB = packs and packs[b] or nil
+        local labelA = tostring((packA and packA.label) or a or "")
+        local labelB = tostring((packB and packB.label) or b or "")
+        if labelA ~= labelB then
+            return labelA < labelB
+        end
+        local tieA = qualifyFn and qualifyFn(a) or a
+        local tieB = qualifyFn and qualifyFn(b) or b
+        return tostring(tieA or "") < tostring(tieB or "")
+    end)
+    if not qualifyFn then
+        return keys
+    end
+    local qualified = {}
+    for _, key in ipairs(keys) do
+        qualified[#qualified + 1] = qualifyFn(key)
+    end
+    return qualified
 end
 
 local function QualifyKey(pluginId, key)
@@ -73,6 +120,156 @@ local function QualifyPackKey(pluginId, key)
         return key
     end
     return QualifyKey(pluginId, key)
+end
+
+local function ValidateTrackList(pluginId, fieldName, list)
+    if list == nil then
+        return
+    end
+    if type(list) ~= "table" then
+        error(("Echoes plugin '%s' field %s must be a list table"):format(pluginId, fieldName))
+    end
+    for i, value in ipairs(list) do
+        if type(value) ~= "number" then
+            error(("Echoes plugin '%s' field %s[%d] must be a number"):format(pluginId, fieldName, i))
+        end
+    end
+end
+
+local function ValidatePackReference(pluginId, packs, ref, fieldName)
+    if ref == nil or ref == "DEFAULT" or ref == "NONE" then
+        return
+    end
+    if type(ref) ~= "string" then
+        error(("Echoes plugin '%s' field %s must be a pack key string"):format(pluginId, fieldName))
+    end
+    local foreignPluginId = SplitQualifiedKey(ref)
+    if foreignPluginId then
+        return
+    end
+    if not (packs and packs[ref]) then
+        error(("Echoes plugin '%s' field %s references unknown pack '%s'"):format(pluginId, fieldName, ref))
+    end
+end
+
+local function ValidatePluginDefinition(def)
+    if type(def) ~= "table" or not def.id then
+        error("Echoes plugin registration requires an id")
+    end
+
+    local pluginId = def.id
+    if type(def.title) ~= "string" or def.title == "" then
+        error(("Echoes plugin '%s' requires a non-empty title"):format(pluginId))
+    end
+
+    local fields = {
+        { key = "tracks", required = true },
+        { key = "durations", required = true },
+        { key = "packs", required = true },
+        { key = "zones", required = true },
+        { key = "locales", required = true },
+        { key = "subzoneNames", required = true },
+    }
+
+    for _, field in ipairs(fields) do
+        local value = def[field.key]
+        if value == nil then
+            if field.required then
+                error(("Echoes plugin '%s' is missing required table '%s'"):format(pluginId, field.key))
+            end
+        elseif type(value) ~= "table" then
+            error(("Echoes plugin '%s' field '%s' must be a table"):format(pluginId, field.key))
+        end
+    end
+
+    if def.subzoneKeys ~= nil and type(def.subzoneKeys) ~= "table" then
+        error(("Echoes plugin '%s' field 'subzoneKeys' must be a table"):format(pluginId))
+    end
+
+    local missingDurationCount = 0
+    for trackName, id in pairs(def.tracks or {}) do
+        if type(trackName) ~= "string" or trackName == "" then
+            error(("Echoes plugin '%s' tracks must use non-empty string keys"):format(pluginId))
+        end
+        if type(id) ~= "number" then
+            error(("Echoes plugin '%s' track '%s' must map to a numeric FileDataID"):format(pluginId, tostring(trackName)))
+        end
+        if (def.durations or {})[id] == nil then
+            missingDurationCount = missingDurationCount + 1
+        end
+    end
+    for id, duration in pairs(def.durations or {}) do
+        if type(id) ~= "number" or type(duration) ~= "number" then
+            error(("Echoes plugin '%s' durations must map numeric FileDataIDs to numeric durations"):format(pluginId))
+        end
+    end
+
+    for packKey, pack in pairs(def.packs or {}) do
+        if type(packKey) ~= "string" or packKey == "" then
+            error(("Echoes plugin '%s' packs must use non-empty string keys"):format(pluginId))
+        end
+        if type(pack) ~= "table" then
+            error(("Echoes plugin '%s' pack '%s' must be a table"):format(pluginId, packKey))
+        end
+        if type(pack.label) ~= "string" or pack.label == "" then
+            error(("Echoes plugin '%s' pack '%s' requires a non-empty label"):format(pluginId, packKey))
+        end
+        if pack.intro ~= nil and type(pack.intro) ~= "number" then
+            error(("Echoes plugin '%s' pack '%s' intro must be a numeric FileDataID"):format(pluginId, packKey))
+        end
+        ValidateTrackList(pluginId, ("packs['%s'].day"):format(packKey), pack.day)
+        ValidateTrackList(pluginId, ("packs['%s'].night"):format(packKey), pack.night)
+        ValidateTrackList(pluginId, ("packs['%s'].any"):format(packKey), pack.any)
+        if pack.day == nil and pack.night == nil and pack.any == nil then
+            error(("Echoes plugin '%s' pack '%s' must define day, night, or any tracks"):format(pluginId, packKey))
+        end
+    end
+
+    local missingZoneLabelCount = 0
+    local missingSubzoneLabelCount = 0
+    for mapId, zoneEntry in pairs(def.zones or {}) do
+        if type(mapId) ~= "number" then
+            error(("Echoes plugin '%s' zone keys must be numeric UiMapIDs"):format(pluginId))
+        end
+        if type(zoneEntry) ~= "table" then
+            error(("Echoes plugin '%s' zone '%s' must be a table"):format(pluginId, tostring(mapId)))
+        end
+        if type(zoneEntry.nameKey) ~= "string" or zoneEntry.nameKey == "" then
+            error(("Echoes plugin '%s' zone '%s' requires a non-empty nameKey"):format(pluginId, tostring(mapId)))
+        end
+        if not (def.locales or EMPTY_LABELS)[zoneEntry.nameKey] then
+            missingZoneLabelCount = missingZoneLabelCount + 1
+        end
+        ValidatePackReference(pluginId, def.packs, zoneEntry.pack, ("zones[%s].pack"):format(mapId))
+        if zoneEntry.subzones ~= nil and type(zoneEntry.subzones) ~= "table" then
+            error(("Echoes plugin '%s' zone '%s' subzones must be a table"):format(pluginId, tostring(mapId)))
+        end
+        for subKey, packRef in pairs(zoneEntry.subzones or {}) do
+            if type(subKey) ~= "string" or subKey == "" then
+                error(("Echoes plugin '%s' zone '%s' subzone keys must be non-empty strings"):format(pluginId, tostring(mapId)))
+            end
+            ValidatePackReference(pluginId, def.packs, packRef, ("zones[%s].subzones['%s']"):format(mapId, subKey))
+            if not (def.subzoneNames or {})[subKey] then
+                missingSubzoneLabelCount = missingSubzoneLabelCount + 1
+            end
+        end
+    end
+
+    if def.packOrder ~= nil then
+        Warn(("Plugin '%s' provided deprecated field 'packOrder'; pack order is now generated alphabetically."):format(pluginId))
+    end
+    if def.subzoneKeys == nil and next(def.subzoneNames or {}) ~= nil then
+        Warn(("Plugin '%s' omitted 'subzoneKeys'; they will be generated automatically from 'subzoneNames'."):format(pluginId))
+    end
+    if missingDurationCount > 0 then
+        Warn(("Plugin '%s' is missing durations for %d track(s)."):format(pluginId, missingDurationCount))
+    end
+    if missingZoneLabelCount > 0 then
+        Warn(("Plugin '%s' is missing locale labels for %d zone name key(s)."):format(pluginId, missingZoneLabelCount))
+    end
+    if missingSubzoneLabelCount > 0 then
+        Warn(("Plugin '%s' is missing labels for %d subzone key(s)."):format(pluginId, missingSubzoneLabelCount))
+    end
 end
 
 local function EnsurePluginState(profile, pluginId)
@@ -221,11 +418,6 @@ local function BuildAggregateCatalog()
                 catalog.packs[qualifiedKey] = aggregatePack
             end
 
-            for _, localKey in ipairs(plugin.packOrder or {}) do
-                catalog.packOrder = catalog.packOrder or {}
-                catalog.packOrder[#catalog.packOrder + 1] = QualifyKey(pluginId, localKey)
-            end
-
             for name, id in pairs(plugin.tracks or {}) do
                 if catalog.trackNames[id] == nil then
                     catalog.trackNames[id] = name
@@ -274,7 +466,11 @@ local function BuildAggregateCatalog()
         end
     end
 
-    catalog.packOrder = catalog.packOrder or {}
+    catalog.packOrder = BuildSortedPackOrder(catalog.packs, function(key)
+        local pack = catalog.packs and catalog.packs[key]
+        local pluginId = pack and pack.pluginId or nil
+        return pluginId and QualifyKey(pluginId, pack.localKey or key) or key
+    end)
     return catalog
 end
 
@@ -332,6 +528,54 @@ local function BuildAggregateSettings(catalog)
     return settings
 end
 
+local function GetCatalogZoneDisplayName(catalog, mapId, zoneEntry)
+    local labels = catalog and catalog.labels or EMPTY_LABELS
+    if zoneEntry and zoneEntry.nameKey and labels[zoneEntry.nameKey] then
+        return labels[zoneEntry.nameKey]
+    end
+    local info = _G.C_Map and _G.C_Map.GetMapInfo and _G.C_Map.GetMapInfo(mapId)
+    return (info and info.name) or ("Zone " .. tostring(mapId))
+end
+
+local function MigrateCollidingCustomZones(catalog)
+    if not db or not db.profiles then
+        return
+    end
+
+    local profile = EnsureProfile(db.activeProfile or "default", "Default")
+    local customState = GetCustomState(profile)
+    local converted = {}
+
+    for mapId, override in pairs(customState.zoneOverrides or {}) do
+        local zoneEntry = catalog and catalog.zones and catalog.zones[mapId]
+        local ownerPluginId = zoneEntry and zoneEntry.pluginId or nil
+        if override and override.isCustom and ownerPluginId and ownerPluginId ~= CUSTOM_PLUGIN_ID then
+            override.isCustom = nil
+            override.name = nil
+
+            if not override.pack and not override.subzones then
+                customState.zoneOverrides[mapId] = nil
+            end
+
+            local plugin = registeredPlugins[ownerPluginId]
+            converted[#converted + 1] = {
+                zoneName = GetCatalogZoneDisplayName(catalog, mapId, zoneEntry),
+                pluginTitle = (plugin and plugin.title) or ownerPluginId,
+            }
+        end
+    end
+
+    if #converted == 0 then
+        return
+    end
+
+    local details = {}
+    for _, entry in ipairs(converted) do
+        details[#details + 1] = ("%s -> %s"):format(entry.zoneName, entry.pluginTitle)
+    end
+    Warn(("Converted %d custom zone collision(s) into plugin overrides: %s"):format(#converted, table.concat(details, ", ")))
+end
+
 local function SyncActivePluginView()
     local plugin, pluginId = GetActivePlugin()
     if db and pluginId then
@@ -356,17 +600,18 @@ local function SyncActivePluginView()
     ns.Tracks = plugin and plugin.tracks or {}
     ns.TrackDurations = plugin and plugin.durations or {}
     ns.MusicPacks = plugin and plugin.packs or {}
-    ns.MusicPackOrder = plugin and plugin.packOrder or {}
+    ns.MusicPackOrder = BuildSortedPackOrder(ns.MusicPacks)
     ns.ZoneMusic = plugin and plugin.zones or {}
     ns.L = plugin and plugin.locales or EMPTY_LABELS
     ns.SubzoneNames = plugin and plugin.subzoneNames or {}
-    ns.SubzoneKeys = plugin and plugin.subzoneKeys or {}
+    ns.SubzoneKeys = (plugin and plugin.subzoneKeys) or BuildDerivedSubzoneKeys(ns.SubzoneNames)
     ns.TrackNames = BuildTrackNames(ns.Tracks)
 end
 
 local function SyncRuntimeCatalog()
     SortPluginOrder()
     runtimeCatalog = BuildAggregateCatalog()
+    MigrateCollidingCustomZones(runtimeCatalog)
     ns.RuntimeCatalog = runtimeCatalog
     ns.RuntimeLabels = runtimeCatalog.labels
     if player and db then
@@ -798,21 +1043,21 @@ local function MergePluginState(targetState, sourceState)
 end
 
 ns.RegisterPlugin = function(def)
-    if type(def) ~= "table" or not def.id then
-        error("Echoes plugin registration requires an id")
-    end
-    if not def.__loadIndex then
+    ValidatePluginDefinition(def)
+    local plugin = DeepCopy(def)
+    plugin.subzoneKeys = plugin.subzoneKeys or BuildDerivedSubzoneKeys(plugin.subzoneNames)
+    if not plugin.__loadIndex then
         pluginRegistrationSeq = pluginRegistrationSeq + 1
-        def.__loadIndex = pluginRegistrationSeq
+        plugin.__loadIndex = pluginRegistrationSeq
     end
-    registeredPlugins[def.id] = def
+    registeredPlugins[plugin.id] = plugin
     if db then
         for _, profile in pairs(db.profiles or {}) do
-            EnsurePluginState(profile, def.id)
+            EnsurePluginState(profile, plugin.id)
             profile.enabledPlugins = profile.enabledPlugins or {}
         end
-        if not db.activePlugin or not registeredPlugins[db.activePlugin] or (db.activePlugin == CUSTOM_PLUGIN_ID and not IsCustomPlugin(def.id)) then
-            db.activePlugin = GetFirstPluginId() or def.id
+        if not db.activePlugin or not registeredPlugins[db.activePlugin] or (db.activePlugin == CUSTOM_PLUGIN_ID and not IsCustomPlugin(plugin.id)) then
+            db.activePlugin = GetFirstPluginId() or plugin.id
         end
     end
     SyncAllViews()
@@ -836,7 +1081,6 @@ ns.RegisterPlugin({
     tracks = {},
     durations = {},
     packs = {},
-    packOrder = {},
     zones = {},
     locales = EMPTY_LABELS,
     subzoneNames = {},

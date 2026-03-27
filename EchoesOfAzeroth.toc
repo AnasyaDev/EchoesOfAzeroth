@@ -9,5 +9,6 @@ lib/LibStub.lua
 lib/LibEchoesMusic.lua
 lib/LibSerialize.lua
 lib/LibDeflate.lua
+PluginDsl.lua
 Core.lua
 Options.lua

@@ -47,8 +47,7 @@ local function GetDefaultNewPackKey()
     if choices[1] then
         return choices[1].key
     end
-    local PACK_ORDER = GetPackOrder()
-    return PACK_ORDER[1] or "DEFAULT"
+    return "DEFAULT"
 end
 
 -- ============================================================
@@ -150,7 +149,25 @@ local function GetFallbackZoneName(mapId)
     return (info and info.name) or ("Zone " .. mapId)
 end
 
-local function AddCustomZone(mapId, customName)
+local function GetPluginTitle(pluginId)
+    local plugins = ns.GetRegisteredPlugins and ns.GetRegisteredPlugins() or nil
+    local plugin = plugins and plugins[pluginId] or nil
+    return (plugin and plugin.title) or pluginId or "Plugin"
+end
+
+local function GetRuntimeZoneEntry(mapId)
+    return ns.RuntimeCatalog and ns.RuntimeCatalog.zones and ns.RuntimeCatalog.zones[mapId] or nil
+end
+
+local function GetZoneOwnerPluginId(zoneId, zoneEntry)
+    if zoneEntry and zoneEntry.pluginId then
+        return zoneEntry.pluginId
+    end
+    local runtimeZone = GetRuntimeZoneEntry(zoneId)
+    return runtimeZone and runtimeZone.pluginId or nil
+end
+
+local function AddCustomZone(mapId, customName, suppressApply)
     local db = ns.db
     if not db then
         return false, "Addon not loaded"
@@ -174,7 +191,9 @@ local function AddCustomZone(mapId, customName)
         name = (customName and customName:trim() ~= "") and customName:trim() or GetFallbackZoneName(mapId),
         pack = GetDefaultNewPackKey(),
     }
-    ApplyZoneMappingChanges()
+    if not suppressApply then
+        ApplyZoneMappingChanges()
+    end
     return true
 end
 
@@ -252,6 +271,82 @@ local function RemoveDeletedCustomPackReferences(deletedKey)
             db.zoneOverrides[mapId] = nil
         end
     end
+end
+
+local function ResolveOrCreateZoneForSubzone(mapId)
+    local zoneId, zoneEntry = ns.ResolveZone and ns.ResolveZone(mapId)
+    if zoneId then
+        return zoneId, zoneEntry, false
+    end
+
+    if not IsCustomPluginSelected() then
+        return nil, nil, false, "Current zone is not configured. Switch to the Custom plugin to create it first."
+    end
+
+    local zoneName = GetFallbackZoneName(mapId)
+    local ok, err = AddCustomZone(mapId, zoneName, true)
+    if not ok then
+        return nil, nil, false, err or "Could not create a custom zone."
+    end
+
+    print(PREFIX .. "Created custom zone: " .. zoneName .. " (" .. mapId .. ")")
+
+    zoneId, zoneEntry = ns.ResolveZone and ns.ResolveZone(mapId)
+    if not zoneId then
+        zoneId = mapId
+        zoneEntry = ns.db and ns.db.zoneOverrides and ns.db.zoneOverrides[mapId] or nil
+    end
+
+    return zoneId, zoneEntry, true
+end
+
+local function AddSubzoneOverride(mapId, subzoneText, rowIsCustom)
+    local db = ns.db
+    if not db then
+        return false, "Addon not loaded."
+    end
+    if not subzoneText or subzoneText == "" then
+        return false, "No subzone detected."
+    end
+    if not mapId then
+        return false, "Cannot determine current zone."
+    end
+
+    local zoneId, zoneEntry, _, resolveErr = ResolveOrCreateZoneForSubzone(mapId)
+    if not zoneId then
+        return false, resolveErr
+    end
+
+    local key = (ns.SubzoneKeys and ns.SubzoneKeys[subzoneText])
+        or (ns.RuntimeCatalog and ns.RuntimeCatalog.subzoneLookup and ns.RuntimeCatalog.subzoneLookup[subzoneText])
+        or subzoneText
+
+    local zoneConfig = GetRuntimeZoneEntry(zoneId) or zoneEntry
+    if zoneConfig and zoneConfig.subzones and zoneConfig.subzones[key] then
+        return false, "Subzone \"" .. subzoneText .. "\" already has a default mapping."
+    end
+
+    db.zoneOverrides = db.zoneOverrides or {}
+    if not db.zoneOverrides[zoneId] then
+        db.zoneOverrides[zoneId] = rowIsCustom and { isCustom = true } or {}
+    end
+    if not db.zoneOverrides[zoneId].subzones then
+        db.zoneOverrides[zoneId].subzones = {}
+    end
+    if db.zoneOverrides[zoneId].subzones[key] then
+        return false, "Subzone \"" .. subzoneText .. "\" already has an override."
+    end
+
+    db.zoneOverrides[zoneId].subzones[key] = "NONE"
+    print(PREFIX .. "Added subzone: " .. subzoneText .. " (zone " .. zoneId .. ")")
+    ApplyZoneMappingChanges()
+
+    local ownerPluginId = GetZoneOwnerPluginId(zoneId, zoneConfig)
+    if ownerPluginId and ownerPluginId ~= GetCustomPluginId() and ownerPluginId ~= ns.ActivePluginId and ns.SetActivePlugin and ns.SetActivePlugin(ownerPluginId) then
+        print(PREFIX .. "Switched to plugin: " .. GetPluginTitle(ownerPluginId) .. " to show the updated subzone.")
+    end
+
+    return true
 end
 
 -- ----- row recycling ------------------------------------------
@@ -602,25 +697,11 @@ StaticPopupDialogs["EOQT_ADD_SUBZONE"] = {
     OnAccept = function(self, data)
         local text = self.EditBox:GetText():trim()
         if text == "" then return end
-        local db = ns.db
-        if not db or not data then return end
-        local mapId = data.mapId
-        if not db.zoneOverrides[mapId] then
-            db.zoneOverrides[mapId] = { isCustom = data.isCustom }
+        if not data then return end
+        local ok, err = AddSubzoneOverride(data.mapId, text, data.isCustom)
+        if not ok then
+            print(PREFIX .. (err or "Could not add subzone."))
         end
-        if not db.zoneOverrides[mapId].subzones then
-            db.zoneOverrides[mapId].subzones = {}
-        end
-        local key = (ns.SubzoneKeys and ns.SubzoneKeys[text])
-            or (ns.RuntimeCatalog and ns.RuntimeCatalog.subzoneLookup and ns.RuntimeCatalog.subzoneLookup[text])
-            or text
-        if db.zoneOverrides[mapId].subzones[key] then
-            print(PREFIX .. "Subzone already exists: " .. text)
-            return
-        end
-        db.zoneOverrides[mapId].subzones[key] = "NONE"
-        print(PREFIX .. "Added subzone: " .. text)
-        ApplyZoneMappingChanges()
     end,
     EditBoxOnEnterPressed = function(self)
         local parent = self:GetParent()
@@ -788,8 +869,6 @@ local function InitZoneMapper()
     btnAddSubzone:SetPoint("TOPLEFT", mapperAddZoneBtn, "BOTTOMLEFT", 0, -4)
     btnAddSubzone:SetText("+ Add Current Subzone")
     btnAddSubzone:SetScript("OnClick", function()
-        local db = ns.db
-        if not db then return end
         local subzoneText = GetSubZoneText()
         if not subzoneText or subzoneText == "" then
             print(PREFIX .. "No subzone detected at current location.")
@@ -800,37 +879,10 @@ local function InitZoneMapper()
             print(PREFIX .. "Cannot determine current zone.")
             return
         end
-        local zoneId = ns.ResolveZone and ns.ResolveZone(mapId)
-        if not zoneId then
-            print(PREFIX .. "Current zone is not configured. Add the zone first.")
-            return
+        local ok, err = AddSubzoneOverride(mapId, subzoneText)
+        if not ok then
+            print(PREFIX .. (err or "Could not add subzone."))
         end
-        local key = (ns.SubzoneKeys and ns.SubzoneKeys[subzoneText])
-            or (ns.RuntimeCatalog and ns.RuntimeCatalog.subzoneLookup and ns.RuntimeCatalog.subzoneLookup[subzoneText])
-            or subzoneText
-        local ZONES = GetZones()
-        local zoneConfig = ZONES[zoneId]
-        if not IsCustomPluginSelected() and not zoneConfig then
-            print(PREFIX .. "Current zone does not belong to the selected plugin.")
-            return
-        end
-        if zoneConfig and zoneConfig.subzones and zoneConfig.subzones[key] then
-            print(PREFIX .. "Subzone \"" .. subzoneText .. "\" already has a default mapping.")
-            return
-        end
-        if not db.zoneOverrides[zoneId] then
-            db.zoneOverrides[zoneId] = {}
-        end
-        if not db.zoneOverrides[zoneId].subzones then
-            db.zoneOverrides[zoneId].subzones = {}
-        end
-        if db.zoneOverrides[zoneId].subzones[key] then
-            print(PREFIX .. "Subzone \"" .. subzoneText .. "\" already has an override.")
-            return
-        end
-        db.zoneOverrides[zoneId].subzones[key] = "NONE"
-        print(PREFIX .. "Added subzone: " .. subzoneText .. " (zone " .. zoneId .. ")")
-        ApplyZoneMappingChanges()
     end)
 
     local scrollFrame = CreateFrame("ScrollFrame", "EoQT_ZoneMapperScroll", mapperFrame, "UIPanelScrollFrameTemplate")
@@ -1616,6 +1668,7 @@ end
 -- ============================================================
 
 local RefreshPluginsPanel
+local RefreshProfileList
 
 local function InitPluginsPanel()
     local pluginsFrame = CreateFrame("Frame", "EoQT_PluginsPanel", UIParent)
@@ -1763,7 +1816,7 @@ local function InitProfilesPanel()
     local ROW_H = 28
     local profileRows = {}
 
-    local function RefreshProfileList()
+    RefreshProfileList = function()
         for _, row in ipairs(profileRows) do row:Hide() end
         profileRows = {}
 
@@ -2158,4 +2211,5 @@ function ns.RefreshAllOptions()
     if RefreshMapper then RefreshMapper() end
     if RefreshPackList then RefreshPackList() end
     if RefreshPluginsPanel then RefreshPluginsPanel() end
+    if RefreshProfileList then RefreshProfileList() end
 end
