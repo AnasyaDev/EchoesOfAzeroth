@@ -2,6 +2,7 @@
 ## Title: Echoes of Azeroth
 ## Notes: Core addon for modular contextual music plugins
 ## Version: 1.0.0
+## IconTexture: Interface\AddOns\EchoesOfAzeroth\icon.png
 ## X-Curse-Project-ID: 1496244
 ## SavedVariables: EchoesOfAzerothDB
 
