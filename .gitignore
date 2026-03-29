@@ -1,0 +1,5 @@
+# Cursor IDE — règles et métadonnées locales (non versionnées)
+.cursor/
+
+# Brouillon d’éditeur à la racine du dépôt
+/Untitled
