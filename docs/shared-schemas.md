@@ -48,6 +48,40 @@ is interpreted as a tri-state with user overrides:
 - `false`: force enabled
 - `nil`: use pack default
 
+User-authored custom packs follow the same shape. Fields may be omitted in
+saved data for backwards compatibility, but the runtime should treat them as:
+
+```lua
+{
+    label = "My Custom Pack",
+    intro = nil,
+    day = {},
+    night = {},
+    any = {},
+}
+```
+
+## Pack Override Schema
+
+```lua
+{
+    disabled = {
+        [12345] = true,
+        [12346] = false,
+    },
+    introEnabled = false,
+}
+```
+
+`packOverrides` are user-authored overrides applied to an existing resolved pack:
+
+- `disabled[id] = true`: force that rotating track off
+- `disabled[id] = false`: force that rotating track on even if disabled by default
+- `disabled[id] = nil`: use the pack default
+- `introEnabled = false`: force the intro off
+- `introEnabled = true`: force the intro on
+- `introEnabled = nil`: use the pack default
+
 ## Zone Schema
 
 ```lua

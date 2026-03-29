@@ -40,6 +40,25 @@ local function DeepCopy(value)
     return out
 end
 
+local function NormalizeCustomPack(pack)
+    local normalized = type(pack) == "table" and DeepCopy(pack) or {}
+    normalized.label = normalized.label or "Custom Pack"
+    normalized.intro = type(normalized.intro) == "number" and normalized.intro or nil
+    normalized.day = type(normalized.day) == "table" and normalized.day or {}
+    normalized.night = type(normalized.night) == "table" and normalized.night or {}
+    normalized.any = type(normalized.any) == "table" and normalized.any or {}
+    return normalized
+end
+
+local function NormalizePackOverride(override)
+    local normalized = type(override) == "table" and DeepCopy(override) or {}
+    normalized.disabled = type(normalized.disabled) == "table" and normalized.disabled or {}
+    if normalized.introEnabled ~= nil and type(normalized.introEnabled) ~= "boolean" then
+        normalized.introEnabled = nil
+    end
+    return normalized
+end
+
 local function BuildTrackNames(tracks)
     local names = {}
     for name, id in pairs(tracks or {}) do
@@ -285,6 +304,12 @@ local function EnsurePluginState(profile, pluginId)
     state.zoneOverrides = state.zoneOverrides or {}
     state.customPacks = state.customPacks or {}
     state.packOverrides = state.packOverrides or {}
+    for localKey, pack in pairs(state.customPacks) do
+        state.customPacks[localKey] = NormalizeCustomPack(pack)
+    end
+    for packKey, override in pairs(state.packOverrides) do
+        state.packOverrides[packKey] = NormalizePackOverride(override)
+    end
     return state
 end
 
@@ -514,7 +539,7 @@ local function BuildAggregateSettings(catalog)
 
     for localKey, pack in pairs(customState.customPacks or {}) do
         local qualifiedKey = QualifyKey(CUSTOM_PLUGIN_ID, localKey)
-        local aggregatePack = DeepCopy(pack)
+        local aggregatePack = NormalizeCustomPack(pack)
         aggregatePack.pluginId = CUSTOM_PLUGIN_ID
         aggregatePack.localKey = localKey
         settings.customPacks[qualifiedKey] = aggregatePack
@@ -522,7 +547,7 @@ local function BuildAggregateSettings(catalog)
 
     for localKey, override in pairs(customState.packOverrides or {}) do
         local qualifiedKey = SplitQualifiedKey(localKey) and localKey or QualifyKey(CUSTOM_PLUGIN_ID, localKey)
-        settings.packOverrides[qualifiedKey] = DeepCopy(override)
+        settings.packOverrides[qualifiedKey] = NormalizePackOverride(override)
     end
 
     return settings

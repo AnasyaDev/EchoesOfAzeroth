@@ -72,6 +72,11 @@ EchoesOfAzerothDB = {
 
 - The core still exposes convenience shortcuts for the active plugin so the
   existing options code can run while the architecture is being modularized.
+- Older custom packs that only contain `{ label, any = {} }` remain valid. The
+  runtime and UI normalize missing `intro`, `day`, and `night` fields
+  implicitly.
+- Older `packOverrides` that only contain `disabled` remain valid. Missing
+  `introEnabled` continues to mean "use the pack default intro behavior".
 - Full-profile export now uses the `EoA:3` payload format and serializes the
   active profile's `plugins` and `enabledPlugins`.
 - Import still accepts older `EoA:1`, `EoQT:1`, and `EoQT:2` payloads for

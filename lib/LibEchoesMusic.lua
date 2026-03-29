@@ -29,6 +29,17 @@ local function tblcopy(src)
     return out
 end
 
+local function listcopy(src)
+    if not src then
+        return nil
+    end
+    local out = {}
+    for i, v in ipairs(src) do
+        out[i] = v
+    end
+    return out
+end
+
 function lib:NewPlayer(opts)
     local player = setmetatable({}, Player)
     player.catalog = {
@@ -198,6 +209,56 @@ function Player:GetPack(key)
     return self.catalog.packs[key] or self.settings.customPacks[key]
 end
 
+function Player:ResolveEffectivePack(config, packKey)
+    if not config then
+        return nil
+    end
+
+    local resolved = {
+        label = config.label,
+        pluginId = config.pluginId,
+        localKey = config.localKey,
+        intro = config.intro,
+        day = listcopy(config.day),
+        night = listcopy(config.night),
+        any = listcopy(config.any),
+    }
+
+    local ov = packKey and self.settings.packOverrides and self.settings.packOverrides[packKey]
+    if ov and ov.introEnabled == false then
+        resolved.intro = nil
+    elseif ov and ov.introEnabled == true then
+        resolved.intro = config.intro
+    end
+
+    local dis = ov and ov.disabled
+    local dbd = config.disabledByDefault
+    if not dis and not dbd then
+        return resolved
+    end
+
+    local function filter(list)
+        if not list then
+            return nil
+        end
+        local filtered = {}
+        for _, id in ipairs(list) do
+            local userSet = dis and dis[id]
+            if userSet ~= true then
+                if userSet == false or not (dbd and dbd[id]) then
+                    filtered[#filtered + 1] = id
+                end
+            end
+        end
+        return filtered
+    end
+
+    resolved.day = filter(resolved.day)
+    resolved.night = filter(resolved.night)
+    resolved.any = filter(resolved.any)
+    return resolved
+end
+
 function Player:ResolveZone(mapId)
     if not mapId then
         return nil, nil
@@ -235,7 +296,7 @@ function Player:ResolveConfig(zoneId, zoneEntry, subzoneText)
             end
             local pack = self:GetPack(packKey)
             if pack then
-                return pack, key, packKey
+                return self:ResolveEffectivePack(pack, packKey), key, packKey
             end
         end
     end
@@ -246,7 +307,7 @@ function Player:ResolveConfig(zoneId, zoneEntry, subzoneText)
             local packKey = zoneEntry.subzones[key]
             local pack = self:GetPack(packKey)
             if pack then
-                return pack, key, packKey
+                return self:ResolveEffectivePack(pack, packKey), key, packKey
             end
         end
     end
@@ -257,14 +318,14 @@ function Player:ResolveConfig(zoneId, zoneEntry, subzoneText)
         end
         local pack = self:GetPack(zoneOv.pack)
         if pack then
-            return pack, nil, zoneOv.pack
+            return self:ResolveEffectivePack(pack, zoneOv.pack), nil, zoneOv.pack
         end
     end
 
     if zoneEntry.pack then
         local pack = self:GetPack(zoneEntry.pack)
         if pack then
-            return pack, nil, zoneEntry.pack
+            return self:ResolveEffectivePack(pack, zoneEntry.pack), nil, zoneEntry.pack
         end
     end
 
@@ -284,24 +345,7 @@ function Player:BuildPool(config, packKey, context)
             pool[#pool + 1] = id
         end
     end
-
-    local ov = packKey and self.settings.packOverrides and self.settings.packOverrides[packKey]
-    local dis = ov and ov.disabled
-    local dbd = config.disabledByDefault
-    if not dis and not dbd then
-        return pool
-    end
-
-    local filtered = {}
-    for _, id in ipairs(pool) do
-        local userSet = dis and dis[id]
-        if userSet ~= true then
-            if userSet == false or not (dbd and dbd[id]) then
-                filtered[#filtered + 1] = id
-            end
-        end
-    end
-    return filtered
+    return pool
 end
 
 function Player:PickTrack(config, packKey, context)

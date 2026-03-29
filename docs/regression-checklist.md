@@ -37,8 +37,12 @@ behavior.
 ## Packs And Profiles
 
 - Enable and disable individual built-in tracks.
+- Disable a built-in pack intro from the UI and confirm it no longer plays.
 - Create, rename, and delete a custom pack.
 - Add and remove tracks from a custom pack.
+- Set and clear a custom pack intro.
+- Create a custom pack with `day` only and confirm it resolves correctly during the day.
+- Create a custom pack with `day`, `night`, and `any` tracks and confirm the correct bucket is used for the current time of day.
 - Confirm custom packs are only editable from the `Custom` plugin page.
 - Confirm zone overrides in `Custom` can target custom packs and packs from enabled content plugins.
 - Confirm packs from disabled content plugins are no longer selectable/resolvable by user overrides.

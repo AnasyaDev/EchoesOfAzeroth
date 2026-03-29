@@ -1,0 +1,12 @@
+---
+description: Keep .toc version and release tag aligned
+alwaysApply: true
+---
+
+# Release Version Alignment
+
+- When preparing a release, update `EchoesOfAzeroth.toc` so `## Version:` matches the intended release number exactly.
+- Create the Git tag in the form `vX.Y.Z`, and keep it aligned with the `.toc` version `X.Y.Z`.
+- For this repo, minor releases should bump `X.Y.Z` consistently in the `.toc` before tagging.
+- Keep the release workflow tag convention aligned with semantic version tags prefixed by `v`.
+- Before tagging, double-check that the version in the `.toc`, the commit intent, and the release tag all refer to the same release.

@@ -71,6 +71,21 @@ local activeRows = {}
 local RefreshMapper
 local ApplyZoneMappingChanges
 
+local RefreshPackList
+local packListFrame, packScrollFrame, packScrollChild, packPluginBtn
+local customSectionHdr
+local packHdrPool    = {}
+local packTrkPool    = {}
+local customHdrPool  = {}
+local customTrkPool  = {}
+local activeHdrs     = {}
+local activeTrks     = {}
+local activeCustomH  = {}
+local activeCustomT  = {}
+local expandedPacks  = {}
+local previewingFdid = nil
+local previewBtnRef  = nil
+
 -- ----- helpers ------------------------------------------------
 
 local function GetPackLabel(key, defaultPackKey)
@@ -227,6 +242,29 @@ local function RefreshOptionsViews()
     end
 end
 
+local function RefreshPackListDeferred()
+    C_Timer.After(0, function()
+        if packListFrame and packListFrame:IsShown() then
+            packListFrame:Hide()
+            packListFrame:Show()
+            return
+        end
+        if RefreshPackList then
+            RefreshPackList()
+        end
+    end)
+end
+
+local function RefreshPackPanelLayout()
+    if not packScrollFrame or not packScrollChild then
+        return
+    end
+    if packScrollFrame.UpdateScrollChildRect then
+        packScrollFrame:UpdateScrollChildRect()
+    end
+    packScrollFrame:SetVerticalScroll(packScrollFrame:GetVerticalScroll() or 0)
+end
+
 local function ApplyRuntimeSettingsOnly()
     if ns.ApplyRuntimeSettings then
         ns.ApplyRuntimeSettings()
@@ -236,7 +274,8 @@ end
 local function ApplyImmediateMusicRefresh()
     ApplyRuntimeSettingsOnly()
     if ns.ForceCheckZone then
-        ns.ForceCheckZone(true)
+        -- Pack edits should refresh the live config without restarting playback.
+        ns.ForceCheckZone(false)
     end
 end
 
@@ -921,22 +960,6 @@ end
 -- 3. Music Packs (Canvas Subcategory)
 -- ============================================================
 
-local RefreshPackList  -- forward declaration; defined below
-
-local packListFrame, packScrollChild, packPluginBtn
-local customSectionHdr  -- persistent, never pooled
-local packHdrPool    = {}
-local packTrkPool    = {}
-local customHdrPool  = {}
-local customTrkPool  = {}
-local activeHdrs     = {}
-local activeTrks     = {}
-local activeCustomH  = {}
-local activeCustomT  = {}
-local expandedPacks  = {}
-local previewingFdid = nil
-local previewBtnRef  = nil
-
 -- ----- track helpers ------------------------------------------
 
 local function GetAllPackTracks(packKey)
@@ -955,6 +978,44 @@ local function GetAllPackTracks(packKey)
     addList(pack.night)
     addList(pack.any)
     return tracks
+end
+
+local function EnsureCustomPackShape(packKey)
+    local packs = ns.db and ns.db.customPacks
+    local pack = packs and packs[packKey]
+    if not pack then
+        return nil
+    end
+    pack.label = pack.label or packKey
+    pack.intro = type(pack.intro) == "number" and pack.intro or nil
+    pack.day = type(pack.day) == "table" and pack.day or {}
+    pack.night = type(pack.night) == "table" and pack.night or {}
+    pack.any = type(pack.any) == "table" and pack.any or {}
+    return pack
+end
+
+local function BuildPackSectionList(pack)
+    return {
+        { key = "day", label = "Day", tracks = pack and pack.day or nil },
+        { key = "night", label = "Night", tracks = pack and pack.night or nil },
+        { key = "any", label = "Any", tracks = pack and pack.any or nil },
+    }
+end
+
+local function CollectPackTrackUsage(pack)
+    local used = {}
+    if not pack then
+        return used
+    end
+    if pack.intro then
+        used[pack.intro] = true
+    end
+    for _, section in ipairs(BuildPackSectionList(pack)) do
+        for _, id in ipairs(section.tracks or {}) do
+            used[id] = true
+        end
+    end
+    return used
 end
 
 -- Returns a sorted list of all known FDIDs with names, grouped by prefix.
@@ -1020,6 +1081,47 @@ local function StopActivePreview()
     if previewBtnRef then previewBtnRef:SetText("Play") end
     previewingFdid = nil
     previewBtnRef  = nil
+end
+
+local function BindPreviewButton(button, fdid)
+    button:SetText("Play")
+    button:SetScript("OnClick", function(self)
+        if previewingFdid == fdid then
+            StopActivePreview()
+        else
+            StopActivePreview()
+            previewingFdid = fdid
+            previewBtnRef = self
+            self:SetText("Stop")
+            if ns.PreviewTrack then
+                ns.PreviewTrack(fdid)
+            end
+        end
+    end)
+end
+
+local function GetOrCreatePackOverride(packKey)
+    ns.db.packOverrides = ns.db.packOverrides or {}
+    if not ns.db.packOverrides[packKey] then
+        ns.db.packOverrides[packKey] = {}
+    end
+    return ns.db.packOverrides[packKey]
+end
+
+local function CleanupPackOverride(packKey)
+    if not ns.db or not ns.db.packOverrides then
+        return
+    end
+    local override = ns.db.packOverrides[packKey]
+    if not override then
+        return
+    end
+    if override.disabled and not next(override.disabled) then
+        override.disabled = nil
+    end
+    if override.introEnabled == nil and not override.disabled then
+        ns.db.packOverrides[packKey] = nil
+    end
 end
 
 -- ----- pack header row recycling ------------------------------
@@ -1209,9 +1311,15 @@ StaticPopupDialogs["EOQT_NEW_PACK"] = {
         local name = self.EditBox:GetText():trim()
         if name == "" then return end
         local key = "cp_" .. time()
-        ns.db.customPacks[key] = { label = name, any = {} }
+        ns.db.customPacks[key] = {
+            label = name,
+            intro = nil,
+            day = {},
+            night = {},
+            any = {},
+        }
         expandedPacks[key] = true
-        RefreshOptionsViews()
+        RefreshPackListDeferred()
     end,
     timeout     = 0,
     whileDead   = true,
@@ -1230,7 +1338,7 @@ StaticPopupDialogs["EOQT_RENAME_PACK"] = {
         local key = self.data
         if ns.db.customPacks[key] then
             ns.db.customPacks[key].label = name
-            RefreshOptionsViews()
+            RefreshPackListDeferred()
         end
     end,
     timeout     = 0,
@@ -1248,7 +1356,7 @@ StaticPopupDialogs["EOQT_DELETE_PACK"] = {
         RemoveDeletedCustomPackReferences(key)
         expandedPacks[key] = nil
         ApplyImmediateMusicRefresh()
-        RefreshOptionsViews()
+        RefreshPackListDeferred()
     end,
     timeout     = 0,
     whileDead   = true,
@@ -1258,7 +1366,7 @@ StaticPopupDialogs["EOQT_DELETE_PACK"] = {
 -- Track picker: a simple scrollable popup listing all tracks not yet in the pack.
 local pickerFrame = nil
 
-local function ShowTrackPicker(packKey, onPicked)
+local function ShowTrackPicker(packKey, title, onPicked)
     local DURATIONS = GetAllDurations()
     if not pickerFrame then
         pickerFrame = CreateFrame("Frame", "EoQT_TrackPicker", UIParent, "BackdropTemplate")
@@ -1306,13 +1414,12 @@ local function ShowTrackPicker(packKey, onPicked)
         if c then c:Hide() end
     end
 
-    local pack = ns.db.customPacks[packKey]
+    local pack = EnsureCustomPackShape(packKey)
     if not pack then pickerFrame:Hide(); return end
 
-    local existing = {}
-    if pack.any then
-        for _, id in ipairs(pack.any) do existing[id] = true end
-    end
+    pickerFrame.titleTxt:SetText(title or "Add Track")
+
+    local existing = CollectPackTrackUsage(pack)
 
     local allTracks = GetAllTracksSorted()
     local y = 0
@@ -1367,6 +1474,58 @@ RefreshPackList = function()
     local db = ns.db
     local y  = 0
 
+    local function AddSectionHeader(indent, label, count)
+        local hdr = AcquirePackHdr(packScrollChild)
+        hdr:SetPoint("TOPLEFT", packScrollChild, "TOPLEFT", indent, -y)
+        hdr:SetPoint("RIGHT", packScrollChild, "RIGHT", 0, 0)
+        hdr.arrow:SetText("")
+        hdr.nameStr:SetText("|cffbbbbbb" .. label .. "|r")
+        hdr.countStr:SetText(count or "")
+        hdr:SetScript("OnClick", nil)
+        activeHdrs[#activeHdrs + 1] = hdr
+        y = y + PACK_HDR_H
+    end
+
+    local function AddCustomActionButton(indent, text, onClick)
+        local btn = CreateFrame("Button", nil, packScrollChild, "UIPanelButtonTemplate")
+        btn:SetSize(110, 20)
+        btn:SetPoint("TOPLEFT", packScrollChild, "TOPLEFT", indent, -y)
+        btn:SetText(text)
+        btn:SetScript("OnClick", onClick)
+        btn._isAddBtn = true
+        activeCustomT[#activeCustomT + 1] = btn
+        y = y + TRACK_ROW_H
+    end
+
+    local function AddBuiltInTrackRow(indent, fdid, checked, onToggle, suffix)
+        local row = AcquirePackTrk(packScrollChild)
+        row:SetPoint("TOPLEFT", packScrollChild, "TOPLEFT", indent, -y)
+        row:SetPoint("RIGHT", packScrollChild, "RIGHT", 0, 0)
+        local trackName = (TRACK_NAMES[fdid] or tostring(fdid)) .. (suffix or "")
+        local dur = DURATIONS[fdid]
+        row.nameLabel:SetText(trackName)
+        row.durLabel:SetText(dur and string.format("%ds", math.floor(dur)) or "?")
+        row.check:SetChecked(checked)
+        row.check:SetScript("OnClick", onToggle)
+        BindPreviewButton(row.playBtn, fdid)
+        activeTrks[#activeTrks + 1] = row
+        y = y + TRACK_ROW_H
+    end
+
+    local function AddCustomTrackRow(indent, fdid, onRemove, suffix)
+        local row = AcquireCustomTrk(packScrollChild)
+        row:SetPoint("TOPLEFT", packScrollChild, "TOPLEFT", indent, -y)
+        row:SetPoint("RIGHT", packScrollChild, "RIGHT", 0, 0)
+        local trackName = (TRACK_NAMES[fdid] or tostring(fdid)) .. (suffix or "")
+        local dur = DURATIONS[fdid]
+        row.nameLabel:SetText(trackName)
+        row.durLabel:SetText(dur and string.format("%ds", math.floor(dur)) or "?")
+        BindPreviewButton(row.playBtn, fdid)
+        row.removeBtn:SetScript("OnClick", onRemove)
+        activeCustomT[#activeCustomT + 1] = row
+        y = y + TRACK_ROW_H
+    end
+
     -- ---- Built-in packs ----
     for _, packKey in ipairs(PACK_ORDER) do
         local pack   = PACKS[packKey]
@@ -1378,7 +1537,7 @@ RefreshPackList = function()
         hdr:SetPoint("TOPLEFT", packScrollChild, "TOPLEFT", 0, -y)
         hdr:SetPoint("RIGHT",   packScrollChild, "RIGHT",   0,  0)
 
-        hdr.arrow:SetText(isOpen and "▼" or "▶")
+        hdr.arrow:SetText(isOpen and "-" or "+")
         hdr.nameStr:SetText(pack.label)
         hdr.countStr:SetText("|cff888888" .. #tracks .. " track" .. (#tracks == 1 and "" or "s") .. "|r")
 
@@ -1405,60 +1564,51 @@ RefreshPackList = function()
                 return dbd and dbd[fdid] or false
             end
 
-            for _, fdid in ipairs(tracks) do
-                local trow = AcquirePackTrk(packScrollChild)
-                trow:SetPoint("TOPLEFT", packScrollChild, "TOPLEFT", INDENT, -y)
-                trow:SetPoint("RIGHT",   packScrollChild, "RIGHT",    0,      0)
-
-                local trackName = TRACK_NAMES[fdid] or tostring(fdid)
-                local dur       = DURATIONS[fdid]
-                trow.nameLabel:SetText(trackName)
-                trow.durLabel:SetText(dur and string.format("%ds", math.floor(dur)) or "?")
-
-                trow.check:SetChecked(not IsTrackDisabled(fdid))
-                trow.check:SetScript("OnClick", function(self)
-                    if not db.packOverrides[overridePackKey] then
-                        db.packOverrides[overridePackKey] = { disabled = {} }
-                    end
-                    if not db.packOverrides[overridePackKey].disabled then
-                        db.packOverrides[overridePackKey].disabled = {}
-                    end
-                    local dis = db.packOverrides[overridePackKey].disabled
-                    if self:GetChecked() then
-                        if dbd and dbd[fdid] then
-                            dis[fdid] = false
+            if pack.intro then
+                AddSectionHeader(INDENT, "Intro", "|cff8888881 track|r")
+                AddBuiltInTrackRow(INDENT * 2, pack.intro,
+                    (db.packOverrides and db.packOverrides[overridePackKey] and db.packOverrides[overridePackKey].introEnabled) ~= false,
+                    function(self)
+                        local override = GetOrCreatePackOverride(overridePackKey)
+                        if self:GetChecked() then
+                            override.introEnabled = nil
                         else
-                            dis[fdid] = nil
+                            override.introEnabled = false
                         end
-                    else
-                        if dis[fdid] == false then
-                            dis[fdid] = nil
-                        else
-                            dis[fdid] = true
-                        end
-                    end
-                    if not next(dis) then
-                        db.packOverrides[overridePackKey] = nil
-                    end
-                    ApplyImmediateMusicRefresh()
-                end)
+                        CleanupPackOverride(overridePackKey)
+                        ApplyImmediateMusicRefresh()
+                    end,
+                    " |cff888888(intro)|r"
+                )
+            end
 
-                local localFdid = fdid
-                trow.playBtn:SetText("Play")
-                trow.playBtn:SetScript("OnClick", function(self)
-                    if previewingFdid == localFdid then
-                        StopActivePreview()
-                    else
-                        StopActivePreview()
-                        previewingFdid = localFdid
-                        previewBtnRef  = self
-                        self:SetText("Stop")
-                        if ns.PreviewTrack then ns.PreviewTrack(localFdid) end
+            for _, section in ipairs(BuildPackSectionList(pack)) do
+                if section.tracks and #section.tracks > 0 then
+                    AddSectionHeader(INDENT, section.label, ("|cff888888%d track%s|r"):format(
+                        #section.tracks, #section.tracks == 1 and "" or "s"))
+                    for _, fdid in ipairs(section.tracks) do
+                        AddBuiltInTrackRow(INDENT * 2, fdid, not IsTrackDisabled(fdid), function(self)
+                            local override = GetOrCreatePackOverride(overridePackKey)
+                            override.disabled = override.disabled or {}
+                            local dis = override.disabled
+                            if self:GetChecked() then
+                                if dbd and dbd[fdid] then
+                                    dis[fdid] = false
+                                else
+                                    dis[fdid] = nil
+                                end
+                            else
+                                if dis[fdid] == false then
+                                    dis[fdid] = nil
+                                else
+                                    dis[fdid] = true
+                                end
+                            end
+                            CleanupPackOverride(overridePackKey)
+                            ApplyImmediateMusicRefresh()
+                        end)
                     end
-                end)
-
-                activeTrks[#activeTrks + 1] = trow
-                y = y + TRACK_ROW_H
+                end
             end
 
             y = y + 4
@@ -1488,14 +1638,13 @@ RefreshPackList = function()
         for _, entry in ipairs(customList) do
             hasCustom = true
             local cpKey  = entry.key
-            local cp     = entry.pack
+            local cp     = EnsureCustomPackShape(cpKey) or entry.pack
             local isOpen = expandedPacks[cpKey]
-            local anyList = cp.any or {}
 
             local hdr = AcquireCustomHdr(packScrollChild)
             hdr:SetPoint("TOPLEFT", packScrollChild, "TOPLEFT", 0, -y)
             hdr:SetPoint("RIGHT",   packScrollChild, "RIGHT",   0,  0)
-            hdr.arrow:SetText(isOpen and "▼" or "▶")
+            hdr.arrow:SetText(isOpen and "-" or "+")
             hdr.nameStr:SetText(cp.label or cpKey)
 
         local capturedKey = cpKey
@@ -1521,64 +1670,63 @@ RefreshPackList = function()
             y = y + PACK_HDR_H
 
             if isOpen then
-                -- Existing tracks in the custom pack
-                for i, fdid in ipairs(anyList) do
-                local trow = AcquireCustomTrk(packScrollChild)
-                trow:SetPoint("TOPLEFT", packScrollChild, "TOPLEFT", INDENT, -y)
-                trow:SetPoint("RIGHT",   packScrollChild, "RIGHT",    0,      0)
-
-                local trackName = TRACK_NAMES[fdid] or tostring(fdid)
-                local dur = DURATIONS[fdid]
-                trow.nameLabel:SetText(trackName)
-                trow.durLabel:SetText(dur and string.format("%ds", math.floor(dur)) or "?")
-
-                trow.playBtn:SetText("Play")
-                local localFdid = fdid
-                trow.playBtn:SetScript("OnClick", function(self)
-                    if previewingFdid == localFdid then
-                        StopActivePreview()
-                    else
-                        StopActivePreview()
-                        previewingFdid = localFdid
-                        previewBtnRef  = self
-                        self:SetText("Stop")
-                        if ns.PreviewTrack then ns.PreviewTrack(localFdid) end
-                    end
-                end)
-
-                local localIdx = i
-                local localKey = cpKey
-                trow.removeBtn:SetScript("OnClick", function()
-                    local list = ns.db.customPacks[localKey] and ns.db.customPacks[localKey].any
-                    if list then
-                        tremove(list, localIdx)
-                        ApplyImmediateMusicRefresh()
-                        RefreshPackList()
-                    end
-                end)
-
-                activeCustomT[#activeCustomT + 1] = trow
-                y = y + TRACK_ROW_H
-            end
-
-                -- "+ Add Track" button
-                local addBtn = CreateFrame("Button", nil, packScrollChild, "UIPanelButtonTemplate")
-                addBtn:SetSize(90, 20)
-                addBtn:SetPoint("TOPLEFT", packScrollChild, "TOPLEFT", INDENT, -y)
-                addBtn:SetText("+ Add Track")
-                local localKey = cpKey
-                addBtn:SetScript("OnClick", function()
-                    ShowTrackPicker(localKey, function(fdid)
-                        if not ns.db.customPacks[localKey] then return end
-                        ns.db.customPacks[localKey].any = ns.db.customPacks[localKey].any or {}
-                        table.insert(ns.db.customPacks[localKey].any, fdid)
-                        ApplyImmediateMusicRefresh()
-                        RefreshPackList()
+                AddSectionHeader(INDENT, "Intro", cp.intro and "|cff8888881 track|r" or "|cff888888empty|r")
+                if cp.intro then
+                    local localKey = cpKey
+                    AddCustomTrackRow(INDENT * 2, cp.intro, function()
+                        local packState = EnsureCustomPackShape(localKey)
+                        if packState then
+                            packState.intro = nil
+                            ApplyImmediateMusicRefresh()
+                            RefreshPackList()
+                        end
+                    end, " |cff888888(intro)|r")
+                else
+                    local localKey = cpKey
+                    AddCustomActionButton(INDENT * 2, "Set Intro", function()
+                        ShowTrackPicker(localKey, "Set Intro", function(fdid)
+                            local packState = EnsureCustomPackShape(localKey)
+                            if not packState then return end
+                            packState.intro = fdid
+                            ApplyImmediateMusicRefresh()
+                            RefreshPackList()
+                        end)
                     end)
-                end)
-                addBtn._isAddBtn = true
-                activeCustomT[#activeCustomT + 1] = addBtn
-                y = y + TRACK_ROW_H + 4
+                end
+
+                for _, section in ipairs(BuildPackSectionList(cp)) do
+                    AddSectionHeader(INDENT, section.label, ("|cff888888%d track%s|r"):format(
+                        #(section.tracks or {}), #(section.tracks or {}) == 1 and "" or "s"))
+                    for i, fdid in ipairs(section.tracks or {}) do
+                        local localIdx = i
+                        local localKey = cpKey
+                        local bucketKey = section.key
+                        AddCustomTrackRow(INDENT * 2, fdid, function()
+                            local packState = EnsureCustomPackShape(localKey)
+                            local list = packState and packState[bucketKey]
+                            if list then
+                                tremove(list, localIdx)
+                                ApplyImmediateMusicRefresh()
+                                RefreshPackList()
+                            end
+                        end)
+                    end
+
+                    local localKey = cpKey
+                    local bucketKey = section.key
+                    AddCustomActionButton(INDENT * 2, "+ Add to " .. section.label, function()
+                        ShowTrackPicker(localKey, "Add to " .. section.label, function(fdid)
+                            local packState = EnsureCustomPackShape(localKey)
+                            if not packState then return end
+                            packState[bucketKey] = packState[bucketKey] or {}
+                            table.insert(packState[bucketKey], fdid)
+                            ApplyImmediateMusicRefresh()
+                            RefreshPackList()
+                        end)
+                    end)
+                end
+
+                y = y + 4
             end
         end
 
@@ -1598,6 +1746,7 @@ RefreshPackList = function()
     end
 
     packScrollChild:SetHeight(math.max(y, 1))
+    RefreshPackPanelLayout()
 end
 
 -- ----- build the canvas frame ---------------------------------
@@ -1622,15 +1771,16 @@ local function InitPacksPanel()
         ShowPluginMenu(self)
     end)
 
-    local scrollFrame = CreateFrame("ScrollFrame", "EoQT_PacksPanelScroll", packListFrame, "UIPanelScrollFrameTemplate")
-    scrollFrame:SetPoint("TOPLEFT",     desc,          "BOTTOMLEFT",  0, -10)
-    scrollFrame:SetPoint("BOTTOMRIGHT", packListFrame, "BOTTOMRIGHT", -26,  8)
+    packScrollFrame = CreateFrame("ScrollFrame", "EoQT_PacksPanelScroll", packListFrame, "UIPanelScrollFrameTemplate")
+    packScrollFrame:SetPoint("TOPLEFT",     desc,          "BOTTOMLEFT",  0, -10)
+    packScrollFrame:SetPoint("BOTTOMRIGHT", packListFrame, "BOTTOMRIGHT", -26,  8)
 
-    packScrollChild = CreateFrame("Frame", nil, scrollFrame)
-    packScrollChild:SetWidth(scrollFrame:GetWidth() or 560)
-    scrollFrame:SetScrollChild(packScrollChild)
-    scrollFrame:SetScript("OnSizeChanged", function(self, w)
+    packScrollChild = CreateFrame("Frame", nil, packScrollFrame)
+    packScrollChild:SetWidth(packScrollFrame:GetWidth() or 560)
+    packScrollFrame:SetScrollChild(packScrollChild)
+    packScrollFrame:SetScript("OnSizeChanged", function(self, w)
         packScrollChild:SetWidth(w)
+        RefreshPackPanelLayout()
     end)
 
     -- Build the persistent Custom Packs section header once
