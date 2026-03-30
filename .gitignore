@@ -3,3 +3,9 @@
 
 # Brouillon d’éditeur à la racine du dépôt
 /Untitled
+
+# Generated files
+/docs/generated
+
+# Tools python cache
+/tools/__pycache__/
