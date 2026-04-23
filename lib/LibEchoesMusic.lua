@@ -546,7 +546,12 @@ function Player:CheckContext(context, forceRestart)
         return
     end
 
-    if ctx.isInInstance then
+    local resolved = self:ResolveContext(ctx)
+
+    -- Historically we suppressed all instance playback so open-world-only
+    -- plugins never fought scripted dungeon/raid music.  When a plugin
+    -- explicitly maps the current UiMapID, allow playback there.
+    if ctx.isInInstance and not (resolved and resolved.effectiveConfig) then
         if self.isPlaying then
             self:Stop(skipFade)
         end
@@ -554,7 +559,6 @@ function Player:CheckContext(context, forceRestart)
         return
     end
 
-    local resolved = self:ResolveContext(ctx)
     self.lastResolution = resolved
 
     if resolved and resolved.effectiveConfig then
