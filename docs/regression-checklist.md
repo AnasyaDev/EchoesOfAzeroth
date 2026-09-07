@@ -30,7 +30,12 @@ behavior.
 
 - Toggle addon enabled state on and off.
 - Toggle `Sound_EnableMusic` and confirm playback reacts immediately.
-- Enter an instance and confirm addon music stops.
+- Log in inside a mapped zone and confirm addon music starts straight away, without the native zone music playing first and fading out. The first login after install has no resume hint; log out (or `/reload`) while addon music plays and log back in: `/eoa trace` must show the silence pre-empt at `ADDON_LOADED`, only silence until `LOADING_SCREEN_DISABLED`, then the real track exactly once (immediately on login/zoning, ~0.75s later after a `/reload`). Nothing audible may play while the loading screen is still up.
+- Log out while addon music plays, log into a character standing in an unmapped zone, and confirm native music comes back (silence released at `PLAYER_ENTERING_WORLD`).
+- With another addon playing music (e.g. boss music) in an unmapped zone, confirm zone changes do not cut it (no `StopMusic` unless Echoes held the channel).
+- Enter an unmapped dungeon and confirm addon music stops immediately instead of inheriting parent-zone music.
+- Enter an unmapped delve or lair (difficulty 208) and confirm addon music stops; `/eoa now` must report `instance: scenario (difficulty 208)`.
+- Enter a mapped instance and confirm addon music starts, including on other floors of the same map group.
 - Exit the instance and confirm addon music resumes where appropriate.
 - Reload after a loading screen and confirm music state is correct.
 

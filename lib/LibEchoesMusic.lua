@@ -14,6 +14,8 @@ local DEFAULT_DUR = 90
 local MAX_DEPTH = 5
 local RANDOM_SAFETY = 20
 local SILENCE_TRACK = "Interface\\AddOns\\EchoesOfAzeroth\\silence.ogg"
+-- Enum.UIMapType.Dungeon: instance maps (dungeons, raids, delves, lairs, scenarios).
+local UIMAP_TYPE_DUNGEON = (_G.Enum and _G.Enum.UIMapType and _G.Enum.UIMapType.Dungeon) or 4
 
 local Player = {}
 Player.__index = Player
@@ -161,11 +163,19 @@ end
 function Player:_playMusic(track)
     local fn = self.transport.PlayMusic or _G.PlayMusic
     if fn then
+        self.channelHeld = true
         fn(track)
     end
 end
 
+-- Only releases the music channel if this player took it: StopMusic would
+-- otherwise cut music started by another addon (boss music, etc.) every time
+-- an unmapped zone is re-checked.
 function Player:_stopMusic()
+    if not self.channelHeld then
+        return
+    end
+    self.channelHeld = false
     local fn = self.transport.StopMusic or _G.StopMusic
     if fn then
         fn()
@@ -186,6 +196,23 @@ function Player:_getMapInfo(mapId)
         return fn(mapId)
     end
     return _G.C_Map.GetMapInfo(mapId)
+end
+
+-- Returns the floors sharing a map group with mapId (multi-level instances), or nil.
+function Player:_getMapGroupMembers(mapId)
+    local fn = self.transport.GetMapGroupMembers
+    if fn then
+        return fn(mapId)
+    end
+    local C_Map = _G.C_Map
+    if not (C_Map and C_Map.GetMapGroupID and C_Map.GetMapGroupMembersInfo) then
+        return nil
+    end
+    local groupId = C_Map.GetMapGroupID(mapId)
+    if not groupId then
+        return nil
+    end
+    return C_Map.GetMapGroupMembersInfo(groupId)
 end
 
 function Player:_cancelTimer(timer)
@@ -259,23 +286,62 @@ function Player:ResolveEffectivePack(config, packKey)
     return resolved
 end
 
-function Player:ResolveZone(mapId)
+function Player:_lookupZone(mapId)
+    local overrides = self.settings.zoneOverrides
+    if overrides and overrides[mapId] and overrides[mapId].isCustom then
+        return overrides[mapId]
+    end
+    return self.catalog.zones[mapId]
+end
+
+-- Resolves the zone entry for a UiMapID.
+--
+-- Open world: walk up the parent chain so interiors and sub-maps inherit the
+-- zone pack.
+--
+-- Instances (isInInstance): dungeon, delve and lair maps hang off the open-world
+-- zone they sit in, so walking up would make every unmapped instance play the
+-- surrounding zone's pack. Only the map itself, the other floors of the same
+-- map group, and Dungeon-type parents (nested instance maps) are considered;
+-- the walk stops before crossing into a Zone/Continent map.
+function Player:ResolveZone(mapId, isInInstance)
     if not mapId then
         return nil, nil
     end
 
-    local overrides = self.settings.zoneOverrides
     for _ = 1, MAX_DEPTH do
-        if overrides and overrides[mapId] and overrides[mapId].isCustom then
-            return mapId, overrides[mapId]
+        local entry = self:_lookupZone(mapId)
+        if entry then
+            return mapId, entry
         end
-        if self.catalog.zones[mapId] then
-            return mapId, self.catalog.zones[mapId]
+
+        if isInInstance then
+            local members = self:_getMapGroupMembers(mapId)
+            if members then
+                for _, member in ipairs(members) do
+                    local memberId = member and member.mapID
+                    if memberId and memberId ~= mapId then
+                        local memberEntry = self:_lookupZone(memberId)
+                        if memberEntry then
+                            return memberId, memberEntry
+                        end
+                    end
+                end
+            end
         end
+
         local info = self:_getMapInfo(mapId)
         if not info or not info.parentMapID or info.parentMapID == 0 then
             return nil, nil
         end
+
+        if isInInstance then
+            local parentInfo = self:_getMapInfo(info.parentMapID)
+            if not parentInfo or parentInfo.mapType ~= UIMAP_TYPE_DUNGEON then
+                return nil, nil
+            end
+        end
+
         mapId = info.parentMapID
     end
 
@@ -500,10 +566,55 @@ function Player:Stop(skipFade)
     end
 end
 
+-- Re-issues PlayMusic for the current track without picking a new one. After
+-- a UI reload the client stops addon music as part of the reload and discards
+-- a PlayMusic issued while it is still reloading, which lets the native zone
+-- music back in even though this player believes it is still playing.
+function Player:ReassertPlayback()
+    if not self.isPlaying or not self.currentTrack or self.isPreviewing then
+        return
+    end
+    local dur = self.catalog.durations[self.currentTrack] or DEFAULT_DUR
+    self:_playMusic(self.currentTrack)
+    self:ScheduleRotation(self.currentTrack, dur)
+end
+
+-- Cuts any current playback state without releasing the channel and holds it
+-- with silence. Used while a loading screen is up: the real track is started
+-- once the world is visible, so nothing audible plays before it.
+function Player:HoldSilence()
+    if self.isPreviewing then
+        return
+    end
+    self:CancelTimers()
+    self.isPlaying = false
+    self.currentZoneId = nil
+    self.currentConfig = nil
+    self.currentGroup = nil
+    self.currentPackKey = nil
+    self.currentTrack = nil
+    self.currentSubKey = nil
+    self:_playMusic(SILENCE_TRACK)
+end
+
+-- Occupies the music channel with silence before the player's map is known
+-- (addon load during the login loading screen) so the native zone music cannot
+-- start first. The next CheckContext with a known map either replaces it with
+-- the real track or releases it with StopMusic.
+function Player:PreemptSilence()
+    if self.isPlaying or self.isPreviewing then
+        return
+    end
+    self:_cancelTimer(self.fadeTimer)
+    self.fadeTimer = nil
+    self:_playMusic(SILENCE_TRACK)
+end
+
 function Player:ResolveContext(context)
     local mapId = context and context.mapId
     local subzoneText = context and context.subzoneText
-    local zoneId, zoneEntry = self:ResolveZone(mapId)
+    local strict = context and (context.isInInstance or context.isEarly) or false
+    local zoneId, zoneEntry = self:ResolveZone(mapId, strict)
     if not zoneId or not zoneEntry then
         return nil
     end
@@ -546,11 +657,27 @@ function Player:CheckContext(context, forceRestart)
         return
     end
 
+    -- Position unknown (typically while a loading screen is up): leave the
+    -- current state alone, including pre-emptive silence, until the map is
+    -- known. Instances are still handled below so stale playback stops.
+    if ctx.mapId == nil and not ctx.isInInstance then
+        return
+    end
+
     local resolved = self:ResolveContext(ctx)
 
-    -- Historically we suppressed all instance playback so open-world-only
-    -- plugins never fought scripted dungeon/raid music.  When a plugin
-    -- explicitly maps the current UiMapID, allow playback there.
+    -- Before PLAYER_ENTERING_WORLD the instance state is not reliable yet: a
+    -- strict (exact / same-instance) match only reserves the channel with
+    -- silence so native music cannot start, and nothing is ever stopped here.
+    if ctx.isEarly then
+        if resolved and resolved.effectiveConfig then
+            self:PreemptSilence()
+        end
+        return
+    end
+
+    -- In instances, ResolveZone never inherits from open-world parent maps,
+    -- so an unmapped dungeon/delve/lair keeps its native music.
     if ctx.isInInstance and not (resolved and resolved.effectiveConfig) then
         if self.isPlaying then
             self:Stop(skipFade)
@@ -561,11 +688,26 @@ function Player:CheckContext(context, forceRestart)
 
     self.lastResolution = resolved
 
+    -- Loading screen still up (PLAYER_ENTERING_WORLD): keep or take the
+    -- channel with silence when music is due here, release it otherwise. The
+    -- real track starts at LOADING_SCREEN_DISABLED.
+    if ctx.holdSilence then
+        if resolved and resolved.effectiveConfig then
+            local sameGroup = self.isPlaying and resolved.groupKey and resolved.groupKey == self.currentGroup
+            if not sameGroup then
+                self:HoldSilence()
+            end
+        else
+            self:Stop(skipFade)
+        end
+        return
+    end
+
     if resolved and resolved.effectiveConfig then
         self:StartMusic(
             resolved.zoneId,
             resolved.effectiveConfig,
-            forceRestart or skipFade,
+            forceRestart,
             resolved.intro,
             resolved.groupKey,
             resolved.subKey

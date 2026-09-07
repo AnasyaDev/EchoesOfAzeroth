@@ -22,7 +22,20 @@ local db
 local player
 local pendingCheck
 local loadingScreenEnded = false
+local reloadPending = false
+local reloadFallbackTimer
+local deviceReassertTimer
 local optionsInitialized = false
+local TRACE_MAX = 120
+local trace = {}
+-- /reload handling: the client drops addon music once shortly after the
+-- loading screen. On a reload we therefore hold the channel with silence and
+-- start the real track only after that window (measured on the precise clock:
+-- C_Timer delays are not reliable around a reload).
+local RELOAD_GAP_SEC = 10            -- PLAYER_LOGOUT -> ADDON_LOADED gap that means /reload rather than relog
+local RELOAD_HOLD_AFTER_LSD = 0.75   -- seconds of silence kept after LOADING_SCREEN_DISABLED on a reload
+local reloadLikely = false           -- set at ADDON_LOADED from the resume hint timestamp
+local reloadHold = nil               -- { lsdAt, ticker } while the post-reload silence hold runs
 local api = _G.EchoesOfAzeroth or {}
 
 _G.EchoesOfAzeroth = api
@@ -73,6 +86,19 @@ local function Warn(message)
         return
     end
     print(PREFIX .. message)
+end
+
+local function TraceNow()
+    local fn = _G.GetTimePreciseSec or _G.GetTime
+    return fn and fn() or 0
+end
+
+-- Small in-memory log of the playback sequence (login/loading timing), shown by /eoa trace.
+local function Trace(message)
+    if #trace >= TRACE_MAX then
+        table.remove(trace, 1)
+    end
+    trace[#trace + 1] = ("%.3f  %s"):format(TraceNow(), message)
 end
 
 local function BuildDerivedSubzoneKeys(subzoneNames)
@@ -866,24 +892,59 @@ local function MigrateLegacyDb(target)
     return target
 end
 
+-- DifficultyUtil.ID.Delves: reported by delves and by 12.1 lairs.
+local DELVE_DIFFICULTY_ID = (_G.DifficultyUtil and _G.DifficultyUtil.ID and _G.DifficultyUtil.ID.Delves) or 208
+
+local function DetectInstance()
+    local inInstance, instanceType = IsInInstance()
+    local _, infoType, difficultyID = GetInstanceInfo()
+    -- IsInInstance() lagged behind inside some delves before 12.0.5, so
+    -- cross-check with GetInstanceInfo(), which also exposes the Delves
+    -- difficulty used by delves and lairs.
+    if not inInstance then
+        if (infoType and infoType ~= "none") or difficultyID == DELVE_DIFFICULTY_ID then
+            inInstance = true
+        end
+    end
+    if infoType == nil or infoType == "none" then
+        infoType = instanceType
+    end
+    return inInstance == true, infoType or "none", difficultyID
+end
+
 local function CaptureContext(isLoadingTransition)
+    local inInstance, instanceType, difficultyID = DetectInstance()
     return {
         mapId = C_Map.GetBestMapForUnit("player"),
         subzoneText = GetSubZoneText() or "",
         zoneText = GetZoneText() or "",
-        isInInstance = IsInInstance(),
+        isInInstance = inInstance,
+        instanceType = instanceType,
+        difficultyID = difficultyID,
         musicEnabled = GetCVar("Sound_EnableMusic") ~= "0",
         isLoadingScreenTransition = isLoadingTransition == true,
         hour = GetGameTime(),
     }
 end
 
-local function CheckZone(forceRestart)
+-- isEarly: before PLAYER_ENTERING_WORLD (instance state unreliable) -> strict
+-- resolution, only reserves the channel with silence, never stops.
+-- holdSilence: loading screen still up -> silence instead of the real track.
+local function CheckZone(forceRestart, isEarly, holdSilence)
     if not player or not db then
         return
     end
+    if reloadHold then
+        Trace("check skipped (reload hold)")
+        return
+    end
     local context = CaptureContext(loadingScreenEnded)
+    context.isEarly = isEarly == true
+    context.holdSilence = holdSilence == true
     loadingScreenEnded = false
+    Trace(("check map=%s sub=%q instance=%s early=%s hold=%s force=%s"):format(
+        tostring(context.mapId), context.subzoneText, tostring(context.isInInstance),
+        tostring(context.isEarly), tostring(context.holdSilence), tostring(forceRestart == true)))
     player:UpdateContext(context, forceRestart)
 end
 
@@ -904,6 +965,44 @@ local function CancelPendingCheck()
     end
 end
 
+local function EndReloadHold(reason)
+    if not reloadHold then
+        return
+    end
+    if reloadHold.ticker then
+        reloadHold.ticker:Cancel()
+    end
+    reloadHold = nil
+    Trace("reload hold released (" .. reason .. ")")
+end
+
+local function ReloadHoldTick()
+    if not reloadHold or not player then
+        return
+    end
+    if TraceNow() >= reloadHold.lsdAt + RELOAD_HOLD_AFTER_LSD then
+        EndReloadHold("hold elapsed")
+        CheckZone()
+        return
+    end
+    -- Keep the channel: if the client just dropped our silence, an inaudible
+    -- silence restart takes it back before native music can be heard.
+    player:PreemptSilence()
+    reloadHold.ticker = C_Timer.NewTimer(0.1, ReloadHoldTick)
+end
+
+-- Called at LOADING_SCREEN_DISABLED after a /reload: the client drops addon
+-- music once within ~0.5s of this point, so keep silence a little longer and
+-- start the real track only afterwards.
+local function BeginReloadHold()
+    if reloadHold or not player then
+        return
+    end
+    reloadHold = { lsdAt = TraceNow() }
+    Trace("reload hold: silence for " .. RELOAD_HOLD_AFTER_LSD .. "s, then start")
+    reloadHold.ticker = C_Timer.NewTimer(0.1, ReloadHoldTick)
+end
+
 local function PrintTrack(track, dur)
     if not db or not db.verbose then
         return
@@ -917,6 +1016,16 @@ local function EnsurePlayer()
         return
     end
     player = MusicLib:NewPlayer({
+        transport = {
+            PlayMusic = function(track)
+                Trace("PlayMusic " .. tostring(track))
+                return PlayMusic(track)
+            end,
+            StopMusic = function()
+                Trace("StopMusic")
+                return StopMusic()
+            end,
+        },
         callbacks = {
             OnTrackStart = PrintTrack,
         },
@@ -1089,6 +1198,9 @@ ns.RegisterPlugin = function(def)
     if optionsInitialized and ns.RefreshAllOptions then
         ns.RefreshAllOptions()
     end
+    -- During the login loading screen the map may already be known: start
+    -- right away (strict match) so native music never gets a head start.
+    CheckZone(false, true)
     ScheduleCheck()
 end
 
@@ -1251,11 +1363,11 @@ ns.BuildPool = function(config, packKey)
     return player:BuildPool(config, effectivePackKey, CaptureContext(false))
 end
 
-ns.ResolveZone = function(mapId)
+ns.ResolveZone = function(mapId, isInInstance)
     if not player then
         return nil, nil
     end
-    return player:ResolveZone(mapId)
+    return player:ResolveZone(mapId, isInInstance == true)
 end
 
 ns.ForceCheckZone = function(forceRestart)
@@ -1275,7 +1387,7 @@ ns.StopPreview = function()
         return
     end
     local context = CaptureContext(false)
-    local zoneId = ns.ResolveZone(context.mapId)
+    local zoneId = ns.ResolveZone(context.mapId, context.isInInstance)
     if zoneId then
         player:StopPreview(context)
     else
@@ -1489,14 +1601,30 @@ ns.ImportIntoNewProfile = function(str, name)
 end
 
 frame:RegisterEvent("ADDON_LOADED")
+frame:RegisterEvent("PLAYER_LOGIN")
 frame:RegisterEvent("PLAYER_LOGOUT")
+frame:RegisterEvent("LOADING_SCREEN_DISABLED")
+frame:RegisterEvent("SOUND_DEVICE_UPDATE")
 frame:RegisterEvent("ZONE_CHANGED_NEW_AREA")
 frame:RegisterEvent("ZONE_CHANGED")
 frame:RegisterEvent("ZONE_CHANGED_INDOORS")
 frame:RegisterEvent("PLAYER_ENTERING_WORLD")
 frame:RegisterEvent("CVAR_UPDATE")
 
-frame:SetScript("OnEvent", function(_, event, arg1)
+local function GetPlayerKey()
+    local guid = _G.UnitGUID and _G.UnitGUID("player")
+    if guid and guid ~= "" then
+        return guid
+    end
+    local name = _G.UnitName and _G.UnitName("player")
+    if name and name ~= "" and name ~= "Unknown" then
+        local realm = _G.GetRealmName and _G.GetRealmName() or ""
+        return name .. "-" .. realm
+    end
+    return nil
+end
+
+frame:SetScript("OnEvent", function(_, event, arg1, arg2)
     if event == "ADDON_LOADED" and arg1 == addonName then
         _G.EchoesOfAzerothDB = _G.EchoesOfAzerothDB or {}
         db = MigrateLegacyDb(_G.EchoesOfAzerothDB)
@@ -1507,23 +1635,139 @@ frame:SetScript("OnEvent", function(_, event, arg1)
             ns.InitOptions()
             optionsInitialized = true
         end
+        -- This character logged out with addon music playing: it will almost
+        -- certainly log back in at the same spot, so grab the music channel
+        -- with silence now, before the native zone music is triggered. The
+        -- first check with a known map replaces or releases it.
+        local key = GetPlayerKey()
+        local hint = key and db.resumeHints and db.resumeHints[key] or nil
+        local wasPlaying = hint == true or (type(hint) == "table" and hint.playing == true)
+        if player and wasPlaying then
+            Trace("ADDON_LOADED: pre-empt native music with silence (resume hint)")
+            player:PreemptSilence()
+            local gap = type(hint) == "table" and hint.at and (time() - hint.at) or nil
+            reloadLikely = gap ~= nil and gap >= 0 and gap <= RELOAD_GAP_SEC
+            if reloadLikely then
+                Trace("resume hint is " .. gap .. "s old: treating this as a /reload")
+            end
+        else
+            Trace("ADDON_LOADED: no resume hint")
+        end
+        return
+    end
+
+    if event == "PLAYER_LOGIN" then
+        Trace("PLAYER_LOGIN")
+        if db then
+            CheckZone(false, true)
+        end
         return
     end
 
     if event == "PLAYER_LOGOUT" then
         CancelPendingCheck()
-        if player then
+        if db and player then
+            local key = GetPlayerKey()
+            if key then
+                db.resumeHints = db.resumeHints or {}
+                if player:GetState().isPlaying then
+                    db.resumeHints[key] = { playing = true, at = time() }
+                else
+                    db.resumeHints[key] = nil
+                end
+            end
             player:Stop(true)
         end
         return
     end
 
-    if event == "PLAYER_ENTERING_WORLD" then
-        loadingScreenEnded = true
+    if event == "LOADING_SCREEN_DISABLED" then
+        Trace("LOADING_SCREEN_DISABLED")
+        if not db then
+            return
+        end
+        if reloadPending and reloadLikely then
+            -- Confirmed /reload with a fresh hint: hold silence past the
+            -- client's post-reload music drop, then start once.
+            reloadPending = false
+            reloadLikely = false
+            BeginReloadHold()
+            return
+        end
+        -- World visible: start the real track now (silence held the channel
+        -- until here, so native music never got in).
+        CancelPendingCheck()
+        CheckZone()
+        -- Subzone text can still settle; re-check once without restarting.
+        ScheduleCheck()
+        if reloadPending then
+            -- Reload without a usable hint: the client may still drop our music
+            -- shortly after this point; re-issue the track as a safety net.
+            reloadPending = false
+            if reloadFallbackTimer then
+                reloadFallbackTimer:Cancel()
+            end
+            reloadFallbackTimer = C_Timer.NewTimer(1.5, function()
+                reloadFallbackTimer = nil
+                Trace("reassert playback (reload fallback timer)")
+                player:ReassertPlayback()
+            end)
+        end
+        return
     end
 
-    if event == "CVAR_UPDATE" and arg1 ~= "Sound_EnableMusic" then
+    if event == "SOUND_DEVICE_UPDATE" then
+        Trace("SOUND_DEVICE_UPDATE")
+        if player and player:GetState().isPlaying then
+            -- A sound device (re)initialisation drops every playing sound,
+            -- including ours; let it settle for a frame and re-issue the
+            -- current track.
+            if reloadFallbackTimer then
+                reloadFallbackTimer:Cancel()
+                reloadFallbackTimer = nil
+            end
+            if deviceReassertTimer then
+                deviceReassertTimer:Cancel()
+            end
+            deviceReassertTimer = C_Timer.NewTimer(0.1, function()
+                deviceReassertTimer = nil
+                Trace("reassert playback after SOUND_DEVICE_UPDATE")
+                player:ReassertPlayback()
+            end)
+        end
         return
+    end
+
+    if event == "PLAYER_ENTERING_WORLD" then
+        if not db then
+            return
+        end
+        local isInitialLogin, isReloadingUi = arg1 == true, arg2 == true
+        Trace(("PLAYER_ENTERING_WORLD login=%s reload=%s"):format(tostring(isInitialLogin), tostring(isReloadingUi)))
+        if not isReloadingUi then
+            reloadLikely = false
+        end
+        -- Loading screen still up: decide now (instance state is reliable
+        -- here) but only with silence. Instance entry releases stale
+        -- open-world playback at once; a mapped destination keeps the channel
+        -- with silence so native music cannot start; the real track starts
+        -- at LOADING_SCREEN_DISABLED. The delayed check is the safety net if
+        -- that event never comes.
+        CancelPendingCheck()
+        loadingScreenEnded = true
+        CheckZone(false, false, true)
+        reloadPending = isReloadingUi
+        ScheduleCheck()
+        return
+    end
+
+    if event == "CVAR_UPDATE" then
+        if type(arg1) == "string" and arg1:find("^Sound") then
+            Trace("CVAR_UPDATE " .. arg1 .. "=" .. tostring(arg2))
+        end
+        if arg1 ~= "Sound_EnableMusic" then
+            return
+        end
     end
 
     if not db then
@@ -1567,7 +1811,7 @@ SlashCmdList["ECHOESOFAZEROTH"] = function(msg)
 
     elseif msg == "now" then
         local context = CaptureContext(false)
-        local zoneId, zoneConfig = ns.ResolveZone(context.mapId)
+        local zoneId, zoneConfig = ns.ResolveZone(context.mapId, context.isInInstance)
         local chain = {}
         local walkId = context.mapId
         for _ = 1, 7 do
@@ -1584,6 +1828,9 @@ SlashCmdList["ECHOESOFAZEROTH"] = function(msg)
 
         print(PREFIX .. "subzone=\"" .. context.subzoneText .. "\"  zone=\"" .. context.zoneText .. "\"")
         print(PREFIX .. "map chain: " .. table.concat(chain, " > "))
+        if context.isInInstance then
+            print(PREFIX .. "instance: " .. tostring(context.instanceType) .. " (difficulty " .. tostring(context.difficultyID) .. ") - parent zones are ignored here, only this map or its floors can be mapped")
+        end
 
         if zoneId and zoneConfig and player then
             local resolved = player:ResolveContext(context)
@@ -1608,6 +1855,12 @@ SlashCmdList["ECHOESOFAZEROTH"] = function(msg)
             Settings.OpenToCategory(ns.settingsCategoryID)
         else
             print(PREFIX .. "Settings panel not ready yet.")
+        end
+
+    elseif msg == "trace" then
+        print(PREFIX .. "Playback trace (" .. #trace .. " entries, oldest first):")
+        for _, line in ipairs(trace) do
+            print("  " .. line)
         end
 
     elseif msg == "verbose" then
@@ -1642,6 +1895,6 @@ SlashCmdList["ECHOESOFAZEROTH"] = function(msg)
         print(PREFIX .. (db.enabled and "Enabled." or "Disabled."))
 
     else
-        print(PREFIX .. "Commands: /eoa [on|off|zones|now|verbose|options|export|plugin <id>]")
+        print(PREFIX .. "Commands: /eoa [on|off|zones|now|trace|verbose|options|export|plugin <id>]")
     end
 end

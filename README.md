@@ -44,6 +44,7 @@ Main sections:
 - `/eoa on`
 - `/eoa off`
 - `/eoa now`
+- `/eoa trace` (timeline of the last login / loading screens and PlayMusic calls, for debugging)
 - `/eoa zones`
 - `/eoa verbose`
 - `/eoa options`
