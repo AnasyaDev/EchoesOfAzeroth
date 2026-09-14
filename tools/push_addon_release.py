@@ -55,11 +55,18 @@ def build_repos() -> dict[str, AddonRepo]:
             parent / "EchoesOfAzeroth_ZulAman",
             "EchoesOfAzeroth_ZulAman.toc",
         ),
+        "voidstorm": AddonRepo(
+            "voidstorm",
+            "EchoesOfAzeroth_Voidstorm",
+            parent / "EchoesOfAzeroth_Voidstorm",
+            "EchoesOfAzeroth_Voidstorm.toc",
+        ),
     }
     aliases = {
         "echoesofazeroth": repos["core"],
         "qt": repos["quelthalas"],
         "za": repos["zulaman"],
+        "vs": repos["voidstorm"],
     }
     return {**repos, **aliases}
 
@@ -101,7 +108,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "addon",
-        help="Addon key: core, quelthalas, zulaman (aliases: echoesofazeroth, qt, za).",
+        help="Addon key: core, quelthalas, zulaman, voidstorm (aliases: echoesofazeroth, qt, za, vs).",
     )
     parser.add_argument(
         "--version",
@@ -264,7 +271,7 @@ def main() -> int:
     repos = build_repos()
     repo = repos.get(args.addon.strip().lower())
     if repo is None:
-        valid = "core, quelthalas, zulaman"
+        valid = "core, quelthalas, zulaman, voidstorm"
         raise RuntimeError(f"Unknown addon `{args.addon}`. Expected one of: {valid}")
 
     if not repo.root.is_dir():
