@@ -2337,6 +2337,29 @@ function ns.InitOptions()
             "Duration of fade-to-silence transitions when leaving addon-controlled music (0 = immediate stop).")
     end
 
+    -- Finish current track
+    do
+        local setting = Settings.RegisterAddOnSetting(category,
+            "EOQT_FINISH_TRACK", "finishTrack", db,
+            Settings.VarType.String, "Finish Current Track", "never")
+        setting:SetValueChangedCallback(function(_, val)
+            db.finishTrack = val
+            if ns.ApplyRuntimeSettings then ns.ApplyRuntimeSettings() end
+        end)
+        local function GetOptions()
+            local container = Settings.CreateControlTextContainer()
+            container:Add("never", "Never",
+                "Switch music as soon as you enter a place with a different pack.")
+            container:Add("subzone", "On subzone changes",
+                "Moving between subzones of the same zone lets the current track finish; entering another zone switches at once.")
+            container:Add("zone", "On subzone and zone changes",
+                "Any change while roaming lets the current track finish, including leaving addon-controlled music (native music then resumes at the end of the track).")
+            return container:GetData()
+        end
+        Settings.CreateDropdown(category, setting, GetOptions,
+            "Let the current track play to its end before the music changes, instead of switching immediately. Loading screens (dungeons, teleports) always switch at once.")
+    end
+
     Settings.RegisterAddOnCategory(category)
     ns.settingsCategoryID = category:GetID()
 

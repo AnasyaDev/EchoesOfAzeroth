@@ -30,6 +30,7 @@ EchoesOfAzerothDB = {
     verbose = false,
     silenceGap = 4,
     crossfadeSec = 3,
+    finishTrack = "never",
     activeProfile = "default",
     profiles = {
         default = {
@@ -59,6 +60,7 @@ EchoesOfAzerothDB = {
 
 - Preserve `enabled`, `verbose`, and `silenceGap`.
 - Introduce `crossfadeSec` with a default of `3` when missing.
+- Introduce `finishTrack` with a default of `"never"` when missing.
 - Introduce `enabledPlugins` per profile. Plugins are enabled by default unless
   explicitly set to `false`.
 - Consolidate all user-authored `zoneOverrides`, `customPacks`, and

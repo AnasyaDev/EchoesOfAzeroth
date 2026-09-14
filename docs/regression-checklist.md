@@ -10,6 +10,9 @@ behavior.
 - Re-enter the same zone and confirm the intro track only plays once per entry.
 - Stay in-zone long enough to verify duration-aware rotation.
 - Verify the silence gap works at `0`, default, and a larger custom value.
+- With `Finish Current Track` = `On subzone changes`: cross into a subzone mapped to another pack and confirm the track keeps playing, then the new pack starts after the silence gap; go back before the track ends and confirm nothing switches; enter another zone and confirm the switch is immediate.
+- With `Finish Current Track` = `On subzone and zone changes`: leave to an unmapped zone and confirm the track plays to its end, then native music comes back with no silence gap; change zone mid-track and confirm the new zone's intro plays once the track ends.
+- With `Finish Current Track` on, enter a dungeon (loading screen) and confirm the switch is still immediate; change a zone mapping in the options and confirm playback restarts at once.
 - Verify preview playback starts and stops correctly.
 
 ## Resolution

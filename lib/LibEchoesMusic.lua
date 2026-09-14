@@ -1,4 +1,4 @@
-local MAJOR, MINOR = "LibEchoesMusic-1.0", 1
+local MAJOR, MINOR = "LibEchoesMusic-1.0", 2
 local LibStub = _G.LibStub
 
 if not LibStub then
@@ -16,6 +16,8 @@ local RANDOM_SAFETY = 20
 local SILENCE_TRACK = "Interface\\AddOns\\EchoesOfAzeroth\\silence.ogg"
 -- Enum.UIMapType.Dungeon: instance maps (dungeons, raids, delves, lairs, scenarios).
 local UIMAP_TYPE_DUNGEON = (_G.Enum and _G.Enum.UIMapType and _G.Enum.UIMapType.Dungeon) or 4
+
+local FINISH_TRACK_MODES = { never = true, subzone = true, zone = true }
 
 local Player = {}
 Player.__index = Player
@@ -56,6 +58,7 @@ function lib:NewPlayer(opts)
         enabled = true,
         silenceGap = 4,
         crossfadeSec = 3,
+        finishTrack = "never",
         verbose = false,
         zoneOverrides = {},
         customPacks = {},
@@ -99,6 +102,7 @@ function Player:ResetState()
     self.fadeTimer = nil
     self.currentContext = nil
     self.lastResolution = nil
+    self.pendingSwitch = nil
 end
 
 function Player:SetTransport(transport)
@@ -134,6 +138,11 @@ function Player:SetSettings(settings)
     else
         self.settings.crossfadeSec = settings.crossfadeSec
     end
+    if FINISH_TRACK_MODES[settings.finishTrack] then
+        self.settings.finishTrack = settings.finishTrack
+    else
+        self.settings.finishTrack = "never"
+    end
     self.settings.verbose = settings.verbose == true
     self.settings.zoneOverrides = settings.zoneOverrides or {}
     self.settings.customPacks = settings.customPacks or {}
@@ -150,6 +159,7 @@ function Player:GetState()
         currentTrack = self.currentTrack,
         currentSubKey = self.currentSubKey,
         lastResolution = self.lastResolution,
+        pendingSwitch = self.pendingSwitch and tblcopy(self.pendingSwitch) or nil,
     }
 end
 
@@ -446,6 +456,7 @@ end
 function Player:HardStop()
     self:CancelTimers()
     self:_stopMusic()
+    self.pendingSwitch = nil
     self.isPlaying = false
     self.currentZoneId = nil
     self.currentConfig = nil
@@ -463,6 +474,7 @@ function Player:FadeOutThenStop()
     end
 
     self:CancelTimers()
+    self.pendingSwitch = nil
     self.isPlaying = false
     self.currentZoneId = nil
     self.currentConfig = nil
@@ -486,9 +498,20 @@ end
 function Player:ScheduleRotation(track, dur)
     self:_cancelTimer(self.rotateTicker)
     self.rotateTicker = self:_newTimer(dur, function()
+        self.rotateTicker = nil
+        local pending = self.pendingSwitch
+        if pending and pending.stop then
+            -- The track was allowed to finish after leaving addon-controlled
+            -- music: hand the channel back to the native music right away.
+            self:HardStop()
+            return
+        end
         self:_playMusic(SILENCE_TRACK)
         self.rotateTicker = self:_newTimer(self.settings.silenceGap, function()
             self.rotateTicker = nil
+            if self.pendingSwitch and self:_applyPendingSwitch() then
+                return
+            end
             if not self.isPlaying or not self.currentConfig then
                 return
             end
@@ -505,6 +528,7 @@ function Player:ScheduleRotation(track, dur)
     end)
 end
 
+-- Returns true when a track was started.
 function Player:BeginPlayback(zoneId, effectiveConfig, introTrack, groupKey, subKey)
     local track
     if introTrack and not self.introPlayed then
@@ -515,11 +539,12 @@ function Player:BeginPlayback(zoneId, effectiveConfig, introTrack, groupKey, sub
     end
 
     if not track then
-        return
+        return false
     end
 
     self:_cancelTimer(self.rotateTicker)
     self.rotateTicker = nil
+    self.pendingSwitch = nil
 
     self.currentZoneId = zoneId
     self.currentConfig = effectiveConfig
@@ -533,10 +558,65 @@ function Player:BeginPlayback(zoneId, effectiveConfig, introTrack, groupKey, sub
     self:_playMusic(track)
     self:_emitTrack(track, dur)
     self:ScheduleRotation(track, dur)
+    return true
+end
+
+-- Whether a context change resolving to newZoneId (nil when the destination
+-- has no addon music) should wait for the current track to end instead of
+-- switching now. See FINISH_TRACK_MODES.
+function Player:_shouldFinishTrack(newZoneId)
+    if not self.isPlaying or not self.currentTrack then
+        return false
+    end
+    local mode = self.settings.finishTrack
+    if mode == "zone" then
+        return true
+    end
+    if mode == "subzone" then
+        return newZoneId ~= nil and newZoneId == self.currentZoneId
+    end
+    return false
+end
+
+-- Records what to do once the current track ends: either start the given
+-- pack (zoneId/effectiveConfig/intro/groupKey/subKey) or, with stop = true,
+-- release the channel. A later context change replaces it; coming back to the
+-- pack being played clears it (see StartMusic).
+function Player:_deferSwitch(pending)
+    local previous = self.pendingSwitch
+    self.pendingSwitch = pending
+    if previous and previous.stop == pending.stop and previous.groupKey == pending.groupKey then
+        return
+    end
+    self:_emit("OnSwitchDeferred", tblcopy(pending), tblcopy(self:GetState()))
+end
+
+-- Runs at the end of the track (after the silence gap for a pack switch).
+-- Returns true when the pending switch was handled; false when the new pack
+-- had no playable track, so the caller keeps rotating the current pack.
+function Player:_applyPendingSwitch()
+    local pending = self.pendingSwitch
+    self.pendingSwitch = nil
+    if not pending then
+        return false
+    end
+    if pending.stop then
+        self:HardStop()
+        return true
+    end
+    if not self.isPlaying then
+        return false
+    end
+    if pending.zoneId ~= self.currentZoneId then
+        self.introPlayed = false
+    end
+    return self:BeginPlayback(pending.zoneId, pending.effectiveConfig, pending.intro, pending.groupKey, pending.subKey)
 end
 
 function Player:StartMusic(zoneId, effectiveConfig, forceRestart, introTrack, groupKey, subKey)
     if not forceRestart and self.isPlaying and groupKey and self.currentGroup and groupKey == self.currentGroup then
+        -- Still on (or back on) the pack being played: nothing to switch to.
+        self.pendingSwitch = nil
         self.currentZoneId = zoneId
         self.currentConfig = effectiveConfig
         self.currentSubKey = subKey
@@ -544,7 +624,19 @@ function Player:StartMusic(zoneId, effectiveConfig, forceRestart, introTrack, gr
     end
 
     if not forceRestart and self.isPlaying and self.currentZoneId == zoneId and self.currentConfig == effectiveConfig then
+        self.pendingSwitch = nil
         self.currentSubKey = subKey
+        return
+    end
+
+    if not forceRestart and self:_shouldFinishTrack(zoneId) then
+        self:_deferSwitch({
+            zoneId = zoneId,
+            effectiveConfig = effectiveConfig,
+            intro = introTrack,
+            groupKey = groupKey,
+            subKey = subKey,
+        })
         return
     end
 
@@ -587,6 +679,7 @@ function Player:HoldSilence()
         return
     end
     self:CancelTimers()
+    self.pendingSwitch = nil
     self.isPlaying = false
     self.currentZoneId = nil
     self.currentConfig = nil
@@ -712,6 +805,8 @@ function Player:CheckContext(context, forceRestart)
             resolved.groupKey,
             resolved.subKey
         )
+    elseif not forceRestart and not skipFade and self:_shouldFinishTrack(resolved and resolved.zoneId) then
+        self:_deferSwitch({ stop = true, zoneId = resolved and resolved.zoneId })
     else
         self:Stop(skipFade)
     end

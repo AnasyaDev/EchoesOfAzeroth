@@ -532,6 +532,7 @@ local function BuildAggregateSettings(catalog)
         verbose = db.verbose,
         silenceGap = db.silenceGap,
         crossfadeSec = db.crossfadeSec,
+        finishTrack = db.finishTrack,
         zoneOverrides = {},
         customPacks = {},
         packOverrides = {},
@@ -820,6 +821,9 @@ local function MigrateLegacyDb(target)
     if target.crossfadeSec == nil then
         target.crossfadeSec = 3
     end
+    if target.finishTrack == nil then
+        target.finishTrack = "never"
+    end
 
     if not target.profiles then
         target.profiles = {}
@@ -1011,6 +1015,31 @@ local function PrintTrack(track, dur)
     print(PREFIX .. name .. "  (" .. string.format("%.0f", dur) .. "s)")
 end
 
+local function DescribePendingSwitch(pending)
+    if not pending then
+        return nil
+    end
+    if pending.stop then
+        return "native music"
+    end
+    local pack = pending.groupKey and ns.GetPack and ns.GetPack(pending.groupKey)
+    local label = pack and pack.label or pending.groupKey or "?"
+    if pending.subKey then
+        label = label .. " (" .. pending.subKey .. ")"
+    end
+    return label
+end
+
+-- "Finish current track" setting: the context changed but the track keeps
+-- playing; `pending` says what starts once it ends.
+local function PrintDeferredSwitch(pending)
+    Trace("switch deferred until track end -> " .. tostring(DescribePendingSwitch(pending)))
+    if not db or not db.verbose then
+        return
+    end
+    print(PREFIX .. "Finishing current track first, then: " .. DescribePendingSwitch(pending))
+end
+
 local function EnsurePlayer()
     if player or not MusicLib then
         return
@@ -1028,6 +1057,7 @@ local function EnsurePlayer()
         },
         callbacks = {
             OnTrackStart = PrintTrack,
+            OnSwitchDeferred = PrintDeferredSwitch,
         },
     })
     if db then
@@ -1848,6 +1878,12 @@ SlashCmdList["ECHOESOFAZEROTH"] = function(msg)
             end
         else
             print(PREFIX .. "No music configured for this location.")
+        end
+        local state = player and player:GetState()
+        if state and state.pendingSwitch then
+            local playing = state.currentPackKey and ns.GetPack and ns.GetPack(state.currentPackKey)
+            local playingLabel = playing and playing.label or state.currentPackKey or "?"
+            print(PREFIX .. "Still playing: " .. playingLabel .. " (finish current track is on); next: " .. DescribePendingSwitch(state.pendingSwitch))
         end
 
     elseif msg == "options" or msg == "config" then

@@ -120,6 +120,7 @@ Core-level settings live at the DB root:
     verbose = false,
     silenceGap = 4,
     crossfadeSec = 3,
+    finishTrack = "never", -- "never" | "subzone" | "zone"
     activeProfile = "default",
     profiles = { ... },
 }

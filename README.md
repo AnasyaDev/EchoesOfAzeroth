@@ -39,6 +39,17 @@ Main sections:
 - `Plugins`
 - `Profiles`
 
+General playback settings (top of the panel):
+
+- `Silence Gap`: seconds of silence between two tracks.
+- `Crossfade`: fade-to-silence length when leaving addon-controlled music.
+- `Finish Current Track`: by default the music switches as soon as you enter a
+  place mapped to a different pack. `On subzone changes` lets the current track
+  play to its end when you move between subzones of the same zone; `On subzone
+  and zone changes` does the same for any change while roaming, including
+  leaving addon-controlled music (the native music resumes once the track
+  ends). Loading screens (dungeons, teleports, login) always switch at once.
+
 ## Slash commands
 
 - `/eoa on`
