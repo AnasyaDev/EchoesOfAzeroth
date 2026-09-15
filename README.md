@@ -48,14 +48,19 @@ General playback settings (top of the panel):
   play to its end when you move between subzones of the same zone; `On subzone
   and zone changes` does the same for any change while roaming, including
   leaving addon-controlled music (the native music resumes once the track
-  ends). Loading screens (dungeons, teleports, login) always switch at once.
+  ends). Loading screens (dungeons, teleports, login) always switch at once:
+  the game cuts addon music on every loading screen, so there is nothing left
+  to finish. A track that started less than 3 seconds ago is switched at once
+  as well (the subzone name can settle shortly after a loading screen).
 
 ## Slash commands
 
 - `/eoa on`
 - `/eoa off`
 - `/eoa now`
-- `/eoa trace` (timeline of the last login / loading screens and PlayMusic calls, for debugging)
+- `/eoa trace` (timeline of the last login / loading screens, zone events and PlayMusic calls, for debugging)
+- `/eoa trace clear` (empty that timeline before reproducing something)
+- `/eoa dev` (toggle: print every event, check and PlayMusic call in the chat as it happens, with the delay since the previous line; the same lines stay available through `/eoa trace`)
 - `/eoa zones`
 - `/eoa verbose`
 - `/eoa options`

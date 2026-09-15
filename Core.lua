@@ -26,7 +26,7 @@ local reloadPending = false
 local reloadFallbackTimer
 local deviceReassertTimer
 local optionsInitialized = false
-local TRACE_MAX = 120
+local TRACE_MAX = 300
 local trace = {}
 -- /reload handling: the client drops addon music once shortly after the
 -- loading screen. On a reload we therefore hold the channel with silence and
@@ -36,6 +36,20 @@ local RELOAD_GAP_SEC = 10            -- PLAYER_LOGOUT -> ADDON_LOADED gap that m
 local RELOAD_HOLD_AFTER_LSD = 0.75   -- seconds of silence kept after LOADING_SCREEN_DISABLED on a reload
 local reloadLikely = false           -- set at ADDON_LOADED from the resume hint timestamp
 local reloadHold = nil               -- { lsdAt, ticker } while the post-reload silence hold runs
+-- Leaving a world through a loading screen: the client cuts addon music at
+-- LOADING_SCREEN_ENABLED, and the native music of the zone being left fills
+-- the second before PLAYER_LEAVING_WORLD. While that window is open the
+-- channel is held with silence, re-issued every tick in case the cut lands
+-- after the event.
+local LEAVE_HOLD_TICK = 0.1
+local leaveHold = nil                -- { ticker } while the pre-loading-screen silence hold runs
+-- Right after a loading screen the client may only know the continent (best
+-- map of type World/Continent) for a moment; the zone map arrives with
+-- ZONE_CHANGED_NEW_AREA. Such an answer is treated as "position unknown" so
+-- the channel stays held with silence instead of being released to the native
+-- music. If no zone map ever comes, the channel is released after this delay.
+local UNKNOWN_MAP_RELEASE_SEC = 3
+local unknownMapTimer = nil
 local api = _G.EchoesOfAzeroth or {}
 
 _G.EchoesOfAzeroth = api
@@ -93,12 +107,28 @@ local function TraceNow()
     return fn and fn() or 0
 end
 
--- Small in-memory log of the playback sequence (login/loading timing), shown by /eoa trace.
+-- Small in-memory log of the playback sequence (login/loading timing), shown by
+-- /eoa trace. With /eoa dev on, every line is also printed as it happens, with
+-- the delay since the previous line, to follow the real order of events.
+local lastTraceAt = nil
 local function Trace(message)
     if #trace >= TRACE_MAX then
         table.remove(trace, 1)
     end
-    trace[#trace + 1] = ("%.3f  %s"):format(TraceNow(), message)
+    local now = TraceNow()
+    trace[#trace + 1] = ("%.3f  %s"):format(now, message)
+    if db and db.devTrace then
+        local delta = lastTraceAt and (now - lastTraceAt) or 0
+        print(("%s|cff9d9d9d[dev +%.3fs]|r %s"):format(PREFIX, delta, message))
+    end
+    lastTraceAt = now
+end
+
+local function ClearTrace()
+    for i = #trace, 1, -1 do
+        trace[i] = nil
+    end
+    lastTraceAt = nil
 end
 
 local function BuildDerivedSubzoneKeys(subzoneNames)
@@ -815,6 +845,9 @@ local function MigrateLegacyDb(target)
     if target.verbose == nil then
         target.verbose = legacy and legacy.verbose or false
     end
+    if target.devTrace == nil then
+        target.devTrace = false
+    end
     if target.silenceGap == nil then
         target.silenceGap = legacy and legacy.silenceGap or 4
     end
@@ -898,6 +931,9 @@ end
 
 -- DifficultyUtil.ID.Delves: reported by delves and by 12.1 lairs.
 local DELVE_DIFFICULTY_ID = (_G.DifficultyUtil and _G.DifficultyUtil.ID and _G.DifficultyUtil.ID.Delves) or 208
+-- Enum.UIMapType.Zone: anything below it (Cosmic, World, Continent) is not a place the
+-- player can be resolved to yet.
+local UIMAP_TYPE_ZONE = (_G.Enum and _G.Enum.UIMapType and _G.Enum.UIMapType.Zone) or 3
 
 local function DetectInstance()
     local inInstance, instanceType = IsInInstance()
@@ -918,8 +954,18 @@ end
 
 local function CaptureContext(isLoadingTransition)
     local inInstance, instanceType, difficultyID = DetectInstance()
+    local mapId = C_Map.GetBestMapForUnit("player")
+    local coarseMapId = nil
+    if mapId then
+        local info = C_Map.GetMapInfo(mapId)
+        if info and info.mapType and info.mapType < UIMAP_TYPE_ZONE then
+            coarseMapId = mapId
+            mapId = nil
+        end
+    end
     return {
-        mapId = C_Map.GetBestMapForUnit("player"),
+        mapId = mapId,
+        coarseMapId = coarseMapId,
         subzoneText = GetSubZoneText() or "",
         zoneText = GetZoneText() or "",
         isInInstance = inInstance,
@@ -929,6 +975,15 @@ local function CaptureContext(isLoadingTransition)
         isLoadingScreenTransition = isLoadingTransition == true,
         hour = GetGameTime(),
     }
+end
+
+-- Where the client says we are right now, for event traces.
+local function DescribePosition()
+    local mapId = C_Map.GetBestMapForUnit("player")
+    local state = player and player:GetState() or nil
+    return (" map=%s zone=%q sub=%q playing=%s"):format(
+        tostring(mapId), GetZoneText() or "", GetSubZoneText() or "",
+        tostring(state and state.isPlaying or false))
 end
 
 -- isEarly: before PLAYER_ENTERING_WORLD (instance state unreliable) -> strict
@@ -942,12 +997,17 @@ local function CheckZone(forceRestart, isEarly, holdSilence)
         Trace("check skipped (reload hold)")
         return
     end
+    if leaveHold then
+        Trace("check skipped (leave hold)")
+        return
+    end
     local context = CaptureContext(loadingScreenEnded)
     context.isEarly = isEarly == true
     context.holdSilence = holdSilence == true
     loadingScreenEnded = false
-    Trace(("check map=%s sub=%q instance=%s early=%s hold=%s force=%s"):format(
-        tostring(context.mapId), context.subzoneText, tostring(context.isInInstance),
+    Trace(("check map=%s%s sub=%q instance=%s early=%s hold=%s force=%s"):format(
+        tostring(context.mapId), context.coarseMapId and (" (coarse " .. context.coarseMapId .. ")") or "",
+        context.subzoneText, tostring(context.isInInstance),
         tostring(context.isEarly), tostring(context.holdSilence), tostring(forceRestart == true)))
     player:UpdateContext(context, forceRestart)
 end
@@ -995,6 +1055,71 @@ local function ReloadHoldTick()
     reloadHold.ticker = C_Timer.NewTimer(0.1, ReloadHoldTick)
 end
 
+local function EndLeaveHold(reason)
+    if not leaveHold then
+        return
+    end
+    if leaveHold.ticker then
+        leaveHold.ticker:Cancel()
+    end
+    leaveHold = nil
+    Trace("leave hold released (" .. reason .. ")")
+end
+
+local function LeaveHoldTick()
+    if not leaveHold or not player then
+        return
+    end
+    -- Inaudible silence restart: takes the channel back if the client just
+    -- dropped it, before the native music of the old zone can be heard.
+    player:PreemptSilence()
+    leaveHold.ticker = C_Timer.NewTimer(LEAVE_HOLD_TICK, LeaveHoldTick)
+end
+
+local function CancelUnknownMapRelease()
+    if unknownMapTimer then
+        unknownMapTimer:Cancel()
+        unknownMapTimer = nil
+    end
+end
+
+-- Armed at LOADING_SCREEN_DISABLED: if the client still has not resolved a
+-- zone map after a while, stop waiting and give the channel back.
+local function ArmUnknownMapRelease()
+    CancelUnknownMapRelease()
+    unknownMapTimer = C_Timer.NewTimer(UNKNOWN_MAP_RELEASE_SEC, function()
+        unknownMapTimer = nil
+        if not player or not db or reloadHold or leaveHold then
+            return
+        end
+        local context = CaptureContext(false)
+        local state = player:GetState()
+        if context.mapId == nil and not context.isInInstance and not state.isPlaying and state.channelHeld then
+            Trace(("map still unknown %ds after LOADING_SCREEN_DISABLED (coarse %s): releasing the channel"):format(
+                UNKNOWN_MAP_RELEASE_SEC, tostring(context.coarseMapId)))
+            player:Stop(true)
+        end
+    end)
+end
+
+-- Called at LOADING_SCREEN_ENABLED: whatever this player was doing with the
+-- channel is over (the client cuts addon music here), so drop that state and
+-- keep silence until the old world is gone. Nothing to protect when the
+-- addon was neither playing nor holding the channel (native music zone).
+local function BeginLeaveHold()
+    if leaveHold or not player then
+        return
+    end
+    local state = player:GetState()
+    if not (state.isPlaying or state.channelHeld) then
+        return
+    end
+    leaveHold = {}
+    player:HoldSilence()
+    Trace("leave hold: silence until PLAYER_LEAVING_WORLD")
+    leaveHold.ticker = C_Timer.NewTimer(LEAVE_HOLD_TICK, LeaveHoldTick)
+end
+
 -- Called at LOADING_SCREEN_DISABLED after a /reload: the client drops addon
 -- music once within ~0.5s of this point, so keep silence a little longer and
 -- start the real track only afterwards.
@@ -1013,6 +1138,21 @@ local function PrintTrack(track, dur)
     end
     local name = runtimeCatalog and runtimeCatalog.trackNames and runtimeCatalog.trackNames[track] or tostring(track)
     print(PREFIX .. name .. "  (" .. string.format("%.0f", dur) .. "s)")
+end
+
+-- Track as shown in traces: "silence", or the plugin symbol with its FileDataID.
+local function DescribeTrack(track)
+    if type(track) == "string" then
+        if track:find("silence%.ogg$") then
+            return "silence"
+        end
+        return track
+    end
+    local name = runtimeCatalog and runtimeCatalog.trackNames and runtimeCatalog.trackNames[track]
+    if name then
+        return name .. " (" .. tostring(track) .. ")"
+    end
+    return tostring(track)
 end
 
 local function DescribePendingSwitch(pending)
@@ -1047,7 +1187,7 @@ local function EnsurePlayer()
     player = MusicLib:NewPlayer({
         transport = {
             PlayMusic = function(track)
-                Trace("PlayMusic " .. tostring(track))
+                Trace("PlayMusic " .. DescribeTrack(track))
                 return PlayMusic(track)
             end,
             StopMusic = function()
@@ -1633,7 +1773,9 @@ end
 frame:RegisterEvent("ADDON_LOADED")
 frame:RegisterEvent("PLAYER_LOGIN")
 frame:RegisterEvent("PLAYER_LOGOUT")
+frame:RegisterEvent("LOADING_SCREEN_ENABLED")
 frame:RegisterEvent("LOADING_SCREEN_DISABLED")
+frame:RegisterEvent("PLAYER_LEAVING_WORLD")
 frame:RegisterEvent("SOUND_DEVICE_UPDATE")
 frame:RegisterEvent("ZONE_CHANGED_NEW_AREA")
 frame:RegisterEvent("ZONE_CHANGED")
@@ -1694,7 +1836,22 @@ frame:SetScript("OnEvent", function(_, event, arg1, arg2)
         return
     end
 
+    if event == "LOADING_SCREEN_ENABLED" then
+        Trace(event .. DescribePosition())
+        if db then
+            BeginLeaveHold()
+        end
+        return
+    end
+
+    if event == "PLAYER_LEAVING_WORLD" then
+        Trace(event .. DescribePosition())
+        EndLeaveHold("PLAYER_LEAVING_WORLD")
+        return
+    end
+
     if event == "PLAYER_LOGOUT" then
+        Trace("PLAYER_LOGOUT" .. DescribePosition())
         CancelPendingCheck()
         if db and player then
             local key = GetPlayerKey()
@@ -1725,9 +1882,13 @@ frame:SetScript("OnEvent", function(_, event, arg1, arg2)
             return
         end
         -- World visible: start the real track now (silence held the channel
-        -- until here, so native music never got in).
+        -- until here, so native music never got in). When the client only
+        -- knows the continent yet, silence stays until ZONE_CHANGED_NEW_AREA
+        -- brings the zone map (checked at once, see below), or until the
+        -- unknown-map release kicks in.
         CancelPendingCheck()
         CheckZone()
+        ArmUnknownMapRelease()
         -- Subzone text can still settle; re-check once without restarting.
         ScheduleCheck()
         if reloadPending then
@@ -1774,6 +1935,8 @@ frame:SetScript("OnEvent", function(_, event, arg1, arg2)
         end
         local isInitialLogin, isReloadingUi = arg1 == true, arg2 == true
         Trace(("PLAYER_ENTERING_WORLD login=%s reload=%s"):format(tostring(isInitialLogin), tostring(isReloadingUi)))
+        EndLeaveHold("PLAYER_ENTERING_WORLD")
+        CancelUnknownMapRelease()
         if not isReloadingUi then
             reloadLikely = false
         end
@@ -1798,6 +1961,23 @@ frame:SetScript("OnEvent", function(_, event, arg1, arg2)
         if arg1 ~= "Sound_EnableMusic" then
             return
         end
+    end
+
+    if event == "ZONE_CHANGED_NEW_AREA" or event == "ZONE_CHANGED" or event == "ZONE_CHANGED_INDOORS" then
+        Trace(event .. DescribePosition())
+        if event == "ZONE_CHANGED_NEW_AREA" and db and player and not player:GetState().isPlaying then
+            -- Nothing audible is playing (channel idle or held with silence,
+            -- typically right after a loading screen): resolve the new zone
+            -- now rather than after the usual settle delay, then re-check
+            -- once for the subzone text.
+            CancelPendingCheck()
+            CheckZone()
+            ScheduleCheck()
+            return
+        end
+    elseif event == "ADDON_LOADED" and db then
+        -- Another addon loaded on demand: it reaches the generic check below.
+        Trace("ADDON_LOADED " .. tostring(arg1))
     end
 
     if not db then
@@ -1843,7 +2023,7 @@ SlashCmdList["ECHOESOFAZEROTH"] = function(msg)
         local context = CaptureContext(false)
         local zoneId, zoneConfig = ns.ResolveZone(context.mapId, context.isInInstance)
         local chain = {}
-        local walkId = context.mapId
+        local walkId = context.mapId or context.coarseMapId
         for _ = 1, 7 do
             if not walkId or walkId == 0 then
                 break
@@ -1899,6 +2079,18 @@ SlashCmdList["ECHOESOFAZEROTH"] = function(msg)
             print("  " .. line)
         end
 
+    elseif msg == "trace clear" then
+        ClearTrace()
+        print(PREFIX .. "Trace cleared.")
+
+    elseif msg == "dev" then
+        db.devTrace = not db.devTrace
+        if db.devTrace then
+            print(PREFIX .. "Dev trace on: every event, check and PlayMusic call is printed as it happens (and kept for /eoa trace).")
+        else
+            print(PREFIX .. "Dev trace off.")
+        end
+
     elseif msg == "verbose" then
         db.verbose = not db.verbose
         SyncRuntimeCatalog()
@@ -1931,6 +2123,6 @@ SlashCmdList["ECHOESOFAZEROTH"] = function(msg)
         print(PREFIX .. (db.enabled and "Enabled." or "Disabled."))
 
     else
-        print(PREFIX .. "Commands: /eoa [on|off|zones|now|trace|verbose|options|export|plugin <id>]")
+        print(PREFIX .. "Commands: /eoa [on|off|zones|now|trace|trace clear|dev|verbose|options|export|plugin <id>]")
     end
 end

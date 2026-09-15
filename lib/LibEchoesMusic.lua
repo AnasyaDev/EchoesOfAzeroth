@@ -1,4 +1,4 @@
-local MAJOR, MINOR = "LibEchoesMusic-1.0", 2
+local MAJOR, MINOR = "LibEchoesMusic-1.0", 3
 local LibStub = _G.LibStub
 
 if not LibStub then
@@ -18,6 +18,12 @@ local SILENCE_TRACK = "Interface\\AddOns\\EchoesOfAzeroth\\silence.ogg"
 local UIMAP_TYPE_DUNGEON = (_G.Enum and _G.Enum.UIMapType and _G.Enum.UIMapType.Dungeon) or 4
 
 local FINISH_TRACK_MODES = { never = true, subzone = true, zone = true }
+
+-- A track younger than this is never "finished": it is switched at once. This
+-- covers the subzone text settling right after a loading screen (the zone
+-- pack started at LOADING_SCREEN_DISABLED, the subzone pack is known half a
+-- second later) and quick passes through an area.
+local FINISH_TRACK_GRACE_SEC = 3
 
 local Player = {}
 Player.__index = Player
@@ -103,6 +109,7 @@ function Player:ResetState()
     self.currentContext = nil
     self.lastResolution = nil
     self.pendingSwitch = nil
+    self.trackStartedAt = nil
 end
 
 function Player:SetTransport(transport)
@@ -160,6 +167,7 @@ function Player:GetState()
         currentSubKey = self.currentSubKey,
         lastResolution = self.lastResolution,
         pendingSwitch = self.pendingSwitch and tblcopy(self.pendingSwitch) or nil,
+        channelHeld = self.channelHeld == true,
     }
 end
 
@@ -190,6 +198,12 @@ function Player:_stopMusic()
     if fn then
         fn()
     end
+end
+
+-- Clock used for the finish-track grace period (seconds, any origin).
+function Player:_now()
+    local fn = self.transport.Now or _G.GetTimePreciseSec or _G.GetTime
+    return fn and fn() or 0
 end
 
 function Player:_newTimer(delay, callback)
@@ -553,6 +567,7 @@ function Player:BeginPlayback(zoneId, effectiveConfig, introTrack, groupKey, sub
     self.currentTrack = track
     self.currentSubKey = subKey
     self.isPlaying = true
+    self.trackStartedAt = self:_now()
 
     local dur = self.catalog.durations[track] or DEFAULT_DUR
     self:_playMusic(track)
@@ -566,6 +581,9 @@ end
 -- switching now. See FINISH_TRACK_MODES.
 function Player:_shouldFinishTrack(newZoneId)
     if not self.isPlaying or not self.currentTrack then
+        return false
+    end
+    if self.trackStartedAt and (self:_now() - self.trackStartedAt) < FINISH_TRACK_GRACE_SEC then
         return false
     end
     local mode = self.settings.finishTrack
@@ -753,7 +771,15 @@ function Player:CheckContext(context, forceRestart)
     -- Position unknown (typically while a loading screen is up): leave the
     -- current state alone, including pre-emptive silence, until the map is
     -- known. Instances are still handled below so stale playback stops.
+    -- Exception: at PLAYER_ENTERING_WORLD the client has already cut every
+    -- addon track (it does so on each loading screen), so a "playing" state
+    -- here is stale and would make the finish-track modes wait for a track
+    -- nobody hears. Drop it and hold the channel with silence; the check at
+    -- LOADING_SCREEN_DISABLED decides between the real track and a release.
     if ctx.mapId == nil and not ctx.isInInstance then
+        if ctx.holdSilence then
+            self:HoldSilence()
+        end
         return
     end
 
@@ -781,15 +807,15 @@ function Player:CheckContext(context, forceRestart)
 
     self.lastResolution = resolved
 
-    -- Loading screen still up (PLAYER_ENTERING_WORLD): keep or take the
-    -- channel with silence when music is due here, release it otherwise. The
-    -- real track starts at LOADING_SCREEN_DISABLED.
+    -- Loading screen still up (PLAYER_ENTERING_WORLD): take the channel with
+    -- silence when music is due here, release it otherwise. The real track
+    -- starts at LOADING_SCREEN_DISABLED. The state is always reset, even when
+    -- the destination resolves to the pack that was playing (or the map is
+    -- still the old one): the client cuts addon music on every loading
+    -- screen, so nothing survives to be kept or finished.
     if ctx.holdSilence then
         if resolved and resolved.effectiveConfig then
-            local sameGroup = self.isPlaying and resolved.groupKey and resolved.groupKey == self.currentGroup
-            if not sameGroup then
-                self:HoldSilence()
-            end
+            self:HoldSilence()
         else
             self:Stop(skipFade)
         end

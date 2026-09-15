@@ -13,6 +13,8 @@ behavior.
 - With `Finish Current Track` = `On subzone changes`: cross into a subzone mapped to another pack and confirm the track keeps playing, then the new pack starts after the silence gap; go back before the track ends and confirm nothing switches; enter another zone and confirm the switch is immediate.
 - With `Finish Current Track` = `On subzone and zone changes`: leave to an unmapped zone and confirm the track plays to its end, then native music comes back with no silence gap; change zone mid-track and confirm the new zone's intro plays once the track ends.
 - With `Finish Current Track` on, enter a dungeon (loading screen) and confirm the switch is still immediate; change a zone mapping in the options and confirm playback restarts at once.
+- With `Finish Current Track` = `On subzone and zone changes`, take a portal between two mapped zones (Silvermoon -> Voidstorm) while a track plays: the old track is cut by the loading screen and the new zone's pack must start at `LOADING_SCREEN_DISABLED`, with no native music in between. `/eoa trace` must show silence at `PLAYER_ENTERING_WORLD` (even with `map=nil`) and no `switch deferred` line. Same check with a portal into a zone that resolves to the pack already playing, and with a portal into an unmapped zone (native music from the start, no deferred stop).
+- With `Finish Current Track` on, arrive by portal in a subzone mapped to another pack than its zone (e.g. The Howling Ridge in Voidstorm): if the subzone name settles after the zone pack started, the switch within 3 seconds must be immediate; a change made later in the track must still wait for the track to end.
 - Verify preview playback starts and stops correctly.
 
 ## Resolution
@@ -34,13 +36,15 @@ behavior.
 - Toggle addon enabled state on and off.
 - Toggle `Sound_EnableMusic` and confirm playback reacts immediately.
 - Log in inside a mapped zone and confirm addon music starts straight away, without the native zone music playing first and fading out. The first login after install has no resume hint; log out (or `/reload`) while addon music plays and log back in: `/eoa trace` must show the silence pre-empt at `ADDON_LOADED`, only silence until `LOADING_SCREEN_DISABLED`, then the real track exactly once (immediately on login/zoning, ~0.75s later after a `/reload`). Nothing audible may play while the loading screen is still up.
-- Log out while addon music plays, log into a character standing in an unmapped zone, and confirm native music comes back (silence released at `PLAYER_ENTERING_WORLD`).
+- Log out while addon music plays, log into a character standing in an unmapped zone, and confirm native music comes back (silence released at `PLAYER_ENTERING_WORLD`, or at the first `ZONE_CHANGED_NEW_AREA` when the client only reported the continent map until then).
+- Take a portal into a mapped zone (Voidstorm -> Silvermoon): no native music between `LOADING_SCREEN_DISABLED` and the addon track. `/eoa trace` must show `check map=nil (coarse 2537)` with silence held, then the track right at `ZONE_CHANGED_NEW_AREA`, never a `StopMusic` at `PLAYER_ENTERING_WORLD`. Take a portal into an unmapped zone and confirm native music starts as soon as the zone map is known (no 3s wait); stay somewhere the client only reports a continent map and confirm the channel is released after ~3s.
 - With another addon playing music (e.g. boss music) in an unmapped zone, confirm zone changes do not cut it (no `StopMusic` unless Echoes held the channel).
 - Enter an unmapped dungeon and confirm addon music stops immediately instead of inheriting parent-zone music.
 - Enter an unmapped delve or lair (difficulty 208) and confirm addon music stops; `/eoa now` must report `instance: scenario (difficulty 208)`.
 - Enter a mapped instance and confirm addon music starts, including on other floors of the same map group.
 - Exit the instance and confirm addon music resumes where appropriate.
 - Reload after a loading screen and confirm music state is correct.
+- Take a portal out of a mapped zone while addon music plays: the native music of the zone being left must not be heard during the first second of the loading screen. `/eoa trace` must show `leave hold` at `LOADING_SCREEN_ENABLED`, silence ticks, then `leave hold released (PLAYER_LEAVING_WORLD)`; leaving an unmapped zone must show no hold at all.
 
 ## Packs And Profiles
 
