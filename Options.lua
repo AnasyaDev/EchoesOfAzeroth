@@ -1072,6 +1072,7 @@ end
 
 function ns.InvalidateOptionCaches()
     TRACK_GROUPS_CACHE = nil
+    if ns.InvalidateTrackEntries then ns.InvalidateTrackEntries() end
     ALL_TRACK_NAMES_CACHE = nil
     ALL_DURATIONS_CACHE = nil
 end
@@ -1363,98 +1364,302 @@ StaticPopupDialogs["EOQT_DELETE_PACK"] = {
     hideOnEscape = true,
 }
 
--- Track picker: a simple scrollable popup listing all tracks not yet in the pack.
+-- ------------------------------------------------------------
+-- Track picker
+--
+-- A searchable, virtualized list of every track known to the enabled
+-- plugins.  Each row shows the plugin symbol, the packs the track
+-- belongs to (how people actually look for music), its duration, a
+-- Play/Stop preview and an Add button.  Adding keeps the picker open
+-- unless the caller asks for a single pick (intro).  Tracks already in
+-- the pack stay visible but greyed out.
+-- ------------------------------------------------------------
+
+local TRACK_ENTRIES_CACHE = nil
+ns.InvalidateTrackEntries = function() TRACK_ENTRIES_CACHE = nil end
+
+-- Builds { id, name, plugin, pluginId, packs, search } for every track,
+-- sorted by name.  `packs` is the comma-joined list of pack labels that
+-- use the track (plugin packs and the user's custom packs).
+local function GetTrackEntries()
+    if TRACK_ENTRIES_CACHE then return TRACK_ENTRIES_CACHE end
+    local plugins = (ns.GetRegisteredPlugins and ns.GetRegisteredPlugins()) or {}
+    local byId = {}
+    local function touch(id)
+        local e = byId[id]
+        if not e then
+            e = { id = id, name = tostring(id), packs = {}, packSeen = {} }
+            byId[id] = e
+        end
+        return e
+    end
+    local function addPack(id, label)
+        if type(id) ~= "number" or not label then return end
+        local e = touch(id)
+        if not e.packSeen[label] then
+            e.packSeen[label] = true
+            e.packs[#e.packs + 1] = label
+        end
+    end
+    local function scanPacks(packs, prefix)
+        for _, pack in pairs(packs or {}) do
+            local label = (prefix or "") .. (pack.label or "?")
+            if pack.intro then addPack(pack.intro, label) end
+            for _, bucket in ipairs({ "day", "night", "any" }) do
+                for _, id in ipairs(pack[bucket] or {}) do addPack(id, label) end
+            end
+        end
+    end
+    for pluginId, plugin in pairs(plugins) do
+        if not ns.IsPluginEnabled or ns.IsPluginEnabled(pluginId) then
+            for name, id in pairs(plugin.tracks or {}) do
+                local e = touch(id)
+                if e.plugin == nil then
+                    e.name = name
+                    e.plugin = plugin.title or pluginId
+                    e.pluginId = pluginId
+                end
+            end
+            scanPacks(plugin.packs)
+        end
+    end
+    if ns.db and ns.db.customPacks then
+        scanPacks(ns.db.customPacks, "Custom: ")
+    end
+    local list = {}
+    for _, e in pairs(byId) do
+        if e.plugin then
+            table.sort(e.packs)
+            e.packSeen = nil
+            e.packText = table.concat(e.packs, ", ")
+            e.search = (e.name .. " " .. e.plugin .. " " .. e.packText .. " " .. tostring(e.id)):lower()
+            list[#list + 1] = e
+        end
+    end
+    table.sort(list, function(a, b) return a.name < b.name end)
+    TRACK_ENTRIES_CACHE = list
+    return list
+end
+
+-- Keeps the entries whose search text contains every word of the query
+-- (case-insensitive) and, when pluginId is set, that belong to it.
+local function FilterTrackEntries(entries, query, pluginId)
+    local words = {}
+    for word in (query or ""):lower():gmatch("%S+") do words[#words + 1] = word end
+    local out = {}
+    for _, e in ipairs(entries) do
+        if not pluginId or e.pluginId == pluginId then
+            local ok = true
+            for _, word in ipairs(words) do
+                if not e.search:find(word, 1, true) then ok = false break end
+            end
+            if ok then out[#out + 1] = e end
+        end
+    end
+    return out
+end
+ns.FilterTrackEntries = FilterTrackEntries
+
+local PICKER_W, PICKER_H, PICKER_ROW_H = 560, 460, 24
 local pickerFrame = nil
 
-local function ShowTrackPicker(packKey, title, onPicked)
-    local DURATIONS = GetAllDurations()
+local function PickerRelayout()
+    local f = pickerFrame
+    if not f or not f.filtered then return end
+    local n = #f.filtered
+    local offset = f.scrollFrame:GetVerticalScroll() or 0
+    local first = math.floor(offset / PICKER_ROW_H) + 1
+    for k, row in ipairs(f.rows) do
+        local idx = first + k - 1
+        local e = f.filtered[idx]
+        if e then
+            row:ClearAllPoints()
+            row:SetPoint("TOPLEFT", f.scrollChild, "TOPLEFT", 0, -(idx - 1) * PICKER_ROW_H)
+            row:SetPoint("RIGHT", f.scrollChild, "RIGHT", 0, 0)
+            row.entry = e
+            row.nameTxt:SetText(e.name)
+            row.packTxt:SetText(e.packText ~= "" and e.packText or e.plugin)
+            local dur = f.durations[e.id]
+            row.durTxt:SetText(dur and string.format("%ds", math.floor(dur)) or "?")
+            BindPreviewButton(row.playBtn, e.id)
+            if previewingFdid == e.id then row.playBtn:SetText("Stop") end
+            local inPack = f.existing[e.id]
+            row.addBtn:SetEnabled(not inPack)
+            row.addBtn:SetText(inPack and "In pack" or "Add")
+            row.nameTxt:SetTextColor(inPack and 0.5 or 1, inPack and 0.5 or 0.82, inPack and 0.5 or 0)
+            row:Show()
+        else
+            row.entry = nil
+            row:Hide()
+        end
+    end
+    f.scrollChild:SetHeight(math.max(n * PICKER_ROW_H, 1))
+    f.countTxt:SetText(("%d / %d tracks"):format(n, #f.entries))
+end
+
+local function PickerApplyFilter()
+    local f = pickerFrame
+    if not f then return end
+    f.filtered = FilterTrackEntries(f.entries, f.searchBox:GetText(), f.pluginFilter)
+    f.scrollFrame:SetVerticalScroll(0)
+    PickerRelayout()
+end
+
+local function CreatePickerFrame()
+    local f = CreateFrame("Frame", "EoQT_TrackPicker", UIParent, "BackdropTemplate")
+    f:SetSize(PICKER_W, PICKER_H)
+    f:SetPoint("CENTER")
+    f:SetFrameStrata("DIALOG")
+    f:SetBackdrop({
+        bgFile   = "Interface/DialogFrame/UI-DialogBox-Background",
+        edgeFile = "Interface/DialogFrame/UI-DialogBox-Border",
+        edgeSize = 16,
+        insets   = { left = 4, right = 4, top = 4, bottom = 4 },
+    })
+    f:EnableMouse(true)
+    f:SetMovable(true)
+    f:RegisterForDrag("LeftButton")
+    f:SetScript("OnDragStart", f.StartMoving)
+    f:SetScript("OnDragStop", f.StopMovingOrSizing)
+    f:SetScript("OnHide", function() StopActivePreview() end)
+    tinsert(UISpecialFrames, "EoQT_TrackPicker") -- Escape closes it
+
+    f.titleTxt = f:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+    f.titleTxt:SetPoint("TOP", 0, -12)
+
+    local closeBtn = CreateFrame("Button", nil, f, "UIPanelCloseButton")
+    closeBtn:SetPoint("TOPRIGHT", -4, -4)
+    closeBtn:SetScript("OnClick", function() f:Hide() end)
+
+    local search = CreateFrame("EditBox", nil, f, "SearchBoxTemplate")
+    search:SetSize(260, 20)
+    search:SetPoint("TOPLEFT", 14, -40)
+    search:SetAutoFocus(false)
+    search:HookScript("OnTextChanged", function() PickerApplyFilter() end)
+    search:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
+    f.searchBox = search
+
+    local pluginBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+    pluginBtn:SetSize(150, 22)
+    pluginBtn:SetPoint("LEFT", search, "RIGHT", 10, 0)
+    pluginBtn:SetText("All plugins")
+    pluginBtn:SetScript("OnClick", function(self)
+        MenuUtil.CreateContextMenu(self, function(_, rootDescription)
+            rootDescription:CreateRadio("All plugins", function() return f.pluginFilter == nil end, function()
+                f.pluginFilter = nil
+                self:SetText("All plugins")
+                PickerApplyFilter()
+            end)
+            local seen, items = {}, {}
+            for _, e in ipairs(f.entries) do
+                if not seen[e.pluginId] then
+                    seen[e.pluginId] = true
+                    items[#items + 1] = { id = e.pluginId, title = e.plugin }
+                end
+            end
+            table.sort(items, function(a, b) return a.title < b.title end)
+            for _, item in ipairs(items) do
+                rootDescription:CreateRadio(item.title, function() return f.pluginFilter == item.id end, function()
+                    f.pluginFilter = item.id
+                    self:SetText(item.title)
+                    PickerApplyFilter()
+                end)
+            end
+        end)
+    end)
+    f.pluginBtn = pluginBtn
+
+    f.countTxt = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    f.countTxt:SetPoint("TOPRIGHT", -30, -46)
+
+    local sf = CreateFrame("ScrollFrame", nil, f, "UIPanelScrollFrameTemplate")
+    sf:SetPoint("TOPLEFT", f, "TOPLEFT", 10, -68)
+    sf:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -28, 10)
+    f.scrollFrame = sf
+
+    local sc = CreateFrame("Frame", nil, sf)
+    sc:SetWidth(sf:GetWidth() or (PICKER_W - 40))
+    sf:SetScrollChild(sc)
+    sf:SetScript("OnSizeChanged", function(_, w) sc:SetWidth(w) end)
+    sf:HookScript("OnVerticalScroll", function() PickerRelayout() end)
+    f.scrollChild = sc
+
+    -- Fixed pool of rows, rebound on scroll (virtualized list).
+    f.rows = {}
+    local poolSize = math.ceil((PICKER_H - 80) / PICKER_ROW_H) + 2
+    for i = 1, poolSize do
+        local row = CreateFrame("Frame", nil, sc)
+        row:SetHeight(PICKER_ROW_H)
+        local hl = row:CreateTexture(nil, "HIGHLIGHT")
+        hl:SetAllPoints()
+        hl:SetTexture("Interface/QuestFrame/UI-QuestTitleHighlight")
+        hl:SetBlendMode("ADD")
+
+        row.addBtn = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
+        row.addBtn:SetSize(58, 20)
+        row.addBtn:SetPoint("RIGHT", -2, 0)
+        row.addBtn:SetScript("OnClick", function()
+            local e = row.entry
+            if not e or not pickerFrame.onPicked or pickerFrame.existing[e.id] then return end
+            pickerFrame.onPicked(e.id)
+            pickerFrame.existing[e.id] = true
+            if pickerFrame.single then
+                pickerFrame:Hide()
+            else
+                PickerRelayout()
+            end
+        end)
+
+        row.playBtn = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
+        row.playBtn:SetSize(46, 20)
+        row.playBtn:SetPoint("RIGHT", row.addBtn, "LEFT", -4, 0)
+
+        row.durTxt = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        row.durTxt:SetPoint("RIGHT", row.playBtn, "LEFT", -8, 0)
+        row.durTxt:SetWidth(36)
+        row.durTxt:SetJustifyH("RIGHT")
+
+        row.nameTxt = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        row.nameTxt:SetPoint("LEFT", 6, 0)
+        row.nameTxt:SetWidth(200)
+        row.nameTxt:SetJustifyH("LEFT")
+        row.nameTxt:SetWordWrap(false)
+
+        row.packTxt = row:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+        row.packTxt:SetPoint("LEFT", row.nameTxt, "RIGHT", 6, 0)
+        row.packTxt:SetPoint("RIGHT", row.durTxt, "LEFT", -6, 0)
+        row.packTxt:SetJustifyH("LEFT")
+        row.packTxt:SetWordWrap(false)
+
+        row:Hide()
+        f.rows[i] = row
+    end
+    return f
+end
+
+-- opts.single: close after the first pick (intro). Otherwise the picker
+-- stays open so several tracks can be added in a row.
+local function ShowTrackPicker(packKey, title, onPicked, opts)
     if not pickerFrame then
-        pickerFrame = CreateFrame("Frame", "EoQT_TrackPicker", UIParent, "BackdropTemplate")
-        pickerFrame:SetSize(400, 380)
-        pickerFrame:SetPoint("CENTER")
-        pickerFrame:SetFrameStrata("DIALOG")
-        pickerFrame:SetBackdrop({
-            bgFile   = "Interface/DialogFrame/UI-DialogBox-Background",
-            edgeFile = "Interface/DialogFrame/UI-DialogBox-Border",
-            edgeSize = 16,
-            insets   = { left = 4, right = 4, top = 4, bottom = 4 },
-        })
-        pickerFrame:EnableMouse(true)
-        pickerFrame:SetMovable(true)
-        pickerFrame:RegisterForDrag("LeftButton")
-        pickerFrame:SetScript("OnDragStart", pickerFrame.StartMoving)
-        pickerFrame:SetScript("OnDragStop",  pickerFrame.StopMovingOrSizing)
-
-        local titleTxt = pickerFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
-        titleTxt:SetPoint("TOP", 0, -12)
-        titleTxt:SetText("Add Track")
-        pickerFrame.titleTxt = titleTxt
-
-        local closeBtn = CreateFrame("Button", nil, pickerFrame, "UIPanelCloseButton")
-        closeBtn:SetPoint("TOPRIGHT", -4, -4)
-        closeBtn:SetScript("OnClick", function() pickerFrame:Hide() end)
-
-        local sf = CreateFrame("ScrollFrame", nil, pickerFrame, "UIPanelScrollFrameTemplate")
-        sf:SetPoint("TOPLEFT",     pickerFrame, "TOPLEFT",     8,  -36)
-        sf:SetPoint("BOTTOMRIGHT", pickerFrame, "BOTTOMRIGHT", -26,  8)
-        pickerFrame.scrollFrame = sf
-
-        local sc = CreateFrame("Frame", nil, sf)
-        sc:SetWidth(sf:GetWidth() or 360)
-        sf:SetScrollChild(sc)
-        sf:SetScript("OnSizeChanged", function(self, w) sc:SetWidth(w) end)
-        pickerFrame.scrollChild = sc
+        pickerFrame = CreatePickerFrame()
     end
-
-    -- Populate the picker with tracks not yet in the pack
-    local sc = pickerFrame.scrollChild
-    -- Release any previous rows
-    for i = sc:GetNumChildren(), 1, -1 do
-        local c = select(i, sc:GetChildren())
-        if c then c:Hide() end
-    end
-
     local pack = EnsureCustomPackShape(packKey)
     if not pack then pickerFrame:Hide(); return end
 
+    StopActivePreview()
+    TRACK_ENTRIES_CACHE = nil -- custom packs may have changed since last time
     pickerFrame.titleTxt:SetText(title or "Add Track")
-
-    local existing = CollectPackTrackUsage(pack)
-
-    local allTracks = GetAllTracksSorted()
-    local y = 0
-    local ROW_H = 22
-    for _, entry in ipairs(allTracks) do
-        if not existing[entry.id] then
-            local btn = CreateFrame("Button", nil, sc)
-            btn:SetHeight(ROW_H)
-            btn:SetPoint("TOPLEFT", sc, "TOPLEFT", 0, -y)
-            btn:SetPoint("RIGHT",   sc, "RIGHT",   0,  0)
-            btn:SetHighlightTexture("Interface/QuestFrame/UI-QuestTitleHighlight", "ADD")
-
-            local lbl = btn:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-            lbl:SetPoint("LEFT", 8, 0)
-            lbl:SetText(entry.name)
-            lbl:SetWidth(260)
-            lbl:SetJustifyH("LEFT")
-
-            local dur = DURATIONS[entry.id]
-            local durLbl = btn:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-            durLbl:SetPoint("RIGHT", -8, 0)
-            durLbl:SetText(dur and string.format("%ds", math.floor(dur)) or "?")
-
-            local capturedId = entry.id
-            btn:SetScript("OnClick", function()
-                onPicked(capturedId)
-                pickerFrame:Hide()
-            end)
-
-            y = y + ROW_H
-        end
-    end
-    sc:SetHeight(math.max(y, 1))
-
+    pickerFrame.onPicked = onPicked
+    pickerFrame.single = opts and opts.single or false
+    pickerFrame.existing = CollectPackTrackUsage(pack)
+    pickerFrame.entries = GetTrackEntries()
+    pickerFrame.durations = GetAllDurations()
+    pickerFrame.pluginFilter = nil
+    pickerFrame.pluginBtn:SetText("All plugins")
+    pickerFrame.searchBox:SetText("")
+    PickerApplyFilter()
     pickerFrame:Show()
+    pickerFrame.searchBox:SetFocus()
 end
 
 -- ----- main render --------------------------------------------
@@ -1690,7 +1895,7 @@ RefreshPackList = function()
                             packState.intro = fdid
                             ApplyImmediateMusicRefresh()
                             RefreshPackList()
-                        end)
+                        end, { single = true })
                     end)
                 end
 

@@ -52,6 +52,7 @@ behavior.
 - Disable a built-in pack intro from the UI and confirm it no longer plays.
 - Create, rename, and delete a custom pack.
 - Add and remove tracks from a custom pack.
+- In the track picker: type two words (e.g. `drakkari night`) and confirm only matching tracks remain; filter by plugin; scroll the full list with the search empty and confirm rows stay correct (virtualized list); Play/Stop a row; add several tracks in a row without the picker closing, with added ones greyed as `In pack`; `Set Intro` closes after one pick; Escape closes the picker and stops the preview.
 - Set and clear a custom pack intro.
 - Create a custom pack with `day` only and confirm it resolves correctly during the day.
 - Create a custom pack with `day`, `night`, and `any` tracks and confirm the correct bucket is used for the current time of day.

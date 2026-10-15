@@ -10,6 +10,7 @@ It provides the runtime, settings UI, profile system, custom packs, custom zones
 - Lets you enable or disable plugins per profile
 - Lets you override zone and subzone mappings
 - Supports custom music packs and custom zones
+- Custom packs pick their tracks from a searchable list (search by name, plugin or pack of origin, preview, add several in a row)
 - Exports and imports profiles
 - Handles track rotation, silence gaps, and crossfade timing
 

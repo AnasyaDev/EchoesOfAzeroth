@@ -854,13 +854,17 @@ function Player:PreviewTrack(fdid)
     self:_playMusic(fdid)
 end
 
+-- The preview replaced whatever was playing, so the zone music has to be
+-- restarted explicitly: a plain check would see the pack as still playing
+-- and leave the channel to the preview track. Without a mapped zone the
+-- channel is released and the playback state cleared.
 function Player:StopPreview(context)
     self.isPreviewing = false
     if context then
         self.currentContext = context
-        self:CheckContext(context)
+        self:CheckContext(context, true)
     else
-        self:_stopMusic()
+        self:HardStop()
     end
 end
 
